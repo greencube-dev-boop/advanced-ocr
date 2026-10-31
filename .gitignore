@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ipynb_checkpoints/
+
+# keys never enter git — api.txt lives only in the Colab runtime
+api.txt
+scratch/
+
+# local outputs
+*.tmp

@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "pdf_render_dpi": 200,
+  "page": {
+    "min_text_chars": 20,
+    "dense_drawings": 40,
+    "large_image_area_ratio": 0.01
+  },
+  "tesseract": {
+    "enabled": true,
+    "lang": "eng",
+    "psm": 3
+  },
+  "suspicion": {
+    "min_confidence": 80.0,
+    "max_len_mismatch": 0.5,
+    "garbage_ratio": 0.08
+  },
+  "nemotron": {
+    "endpoint": "https://ai.api.nvidia.com/v1/retrieval/nvidia/nemotron-3.5-parse/parse",
+    "max_output_tokens": 4096,
+    "timeout_sec": 180,
+    "max_retries": 4,
+    "backoff_sec": 5.0,
+    "table_format": "markdown"
+  },
+  "refiner": {
+    "enabled": true,
+    "backend": "gemma_local",
+    "skip_if_unavailable": true,
+    "gemma_local": {
+      "model_id": "google/gemma-3-4b-it",
+      "quantization": "4bit",
+      "max_new_tokens": 2048,
+      "temperature": 0.1,
+      "hf_token": ""
+    },
+    "gemini_api": {
+      "model": "gemini-2.0-flash",
+      "api_key": "",
+      "timeout_sec": 120,
+      "max_retries": 5,
+      "rpm": 14,
+      "temperature": 0.1,
+      "max_output_tokens": 8192
+    }
+  },
+  "output": {
+    "add_page_markers": true,
+    "equations": "latex",
+    "page_separator": "---"
+  },
+  "prompt_version": "page-refine-v1"
+}
