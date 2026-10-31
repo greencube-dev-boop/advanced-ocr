@@ -1,15 +1,15 @@
-"""CLI entry point: python -m ocr_pipeline <command> [--drive-root ...] [--api-file ...]"""
+"""CLI entry point: python -m ocr_pipeline <command> [--drive-root ...]"""
 from __future__ import annotations
 
 import argparse
 import importlib
+import shutil
 import sys
+from pathlib import Path
 
 from .drive import DriveLayout
-from .keys import load_api_txt
 from .logging_setup import setup_logging
 from .pipeline import Pipeline
-from .refine.refiner import build_refiner
 from .settings import DEFAULTS, Cfg, load_config, save_config
 from .state import StateStore
 
@@ -17,18 +17,22 @@ from .state import StateStore
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="ocr_pipeline",
-        description="Advanced OCR pipeline — the Colab notebook only calls this.")
-    ap.add_argument("--drive-root", default="/content/drive/MyDrive/OCR Engine",
-                    help="Path to the 'OCR Engine' folder on the mounted Drive")
-    ap.add_argument("--api-file", default="api.txt",
-                    help="api.txt: line 1 = NVIDIA key, optional KEY=value lines after")
+        description="Advanced OCR pipeline v2 (OXR-1.0) — the Colab notebook only calls this.")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--drive-root", default="/content/drive/MyDrive/OCR Engine",
+                        help="Path to the 'OCR Engine' folder on the mounted Drive")
     sub = ap.add_subparsers(dest="command", required=True)
-    sub.add_parser("run", help="Process all pending PDFs in raw/ (resumable)")
-    p_book = sub.add_parser("run-book", help="Process a single PDF from raw/")
+    sub.add_parser("run", help="Process all pending PDFs in raw/ (resumable)", parents=[common])
+    p_book = sub.add_parser("run-book", help="Process a single PDF from raw/", parents=[common])
     p_book.add_argument("name", help="file name, e.g. mybook.pdf")
-    sub.add_parser("status", help="Show the resume state (books.json)")
-    sub.add_parser("doctor", help="Check environment: deps, keys, drive, tesseract")
-    sub.add_parser("init-config", help="Write the default pipeline.json into Drive config/")
+    sub.add_parser("status", help="Show the resume state (books.json)", parents=[common])
+    p_reset = sub.add_parser("reset", help="Forget a book's state and temp files (reprocess)",
+                             parents=[common])
+    p_reset.add_argument("name", help="file name, e.g. mybook.pdf")
+    sub.add_parser("doctor", help="Check environment: deps, drive, OXR reachability",
+                   parents=[common])
+    sub.add_parser("init-config", help="Write the default pipeline.json into Drive config/",
+                   parents=[common])
     args = ap.parse_args(argv)
 
     log = setup_logging()
@@ -45,7 +49,6 @@ def main(argv=None) -> int:
         return 0
 
     cfg = load_config(layout.pipeline_json)
-    keys = load_api_txt(args.api_file)
     state = StateStore(layout.books_json)
 
     if args.command == "status":
@@ -56,11 +59,17 @@ def main(argv=None) -> int:
                   f"counts={state.counts(name)} output={entry.get('output')}")
         return 0
 
-    if args.command == "doctor":
-        return _doctor(layout, cfg, keys)
+    if args.command == "reset":
+        stem = Path(args.name).stem
+        shutil.rmtree(layout.book_temp(stem), ignore_errors=True)
+        state.forget(args.name)
+        print(f"reset: {args.name} (temp cleared, state forgotten)")
+        return 0
 
-    refiner = build_refiner(cfg, keys)
-    pipe = Pipeline(layout, cfg, keys, state, refiner)
+    if args.command == "doctor":
+        return _doctor(layout, cfg)
+
+    pipe = Pipeline(layout, cfg, state)
     if args.command == "run":
         pipe.run_all()
     elif args.command == "run-book":
@@ -72,26 +81,34 @@ def main(argv=None) -> int:
     return 0
 
 
-def _doctor(layout, cfg, keys) -> int:
+def _doctor(layout, cfg) -> int:
+    import requests
+
     print(f"drive root : {layout.root} (exists={layout.root.exists()})")
     print(f"raw pdfs   : {[p.name for p in layout.list_pdfs()]}")
-    print(f"NVIDIA key : {'set' if keys.nvidia else 'MISSING'} "
-          f"(nemotron escalation {'ON' if keys.nvidia else 'OFF'})")
-    print(f"GEMINI key : {'set' if keys.gemini else 'empty (gemma_local keyless backend is default; fill later to use Gemini)'}")
-    print(f"HF token   : {'set' if keys.hf_token else 'empty (only needed if Gemma license not yet accepted on your HF account)'}")
-    for mod in ("fitz", "pytesseract", "PIL", "requests"):
+    for mod in ("fitz", "requests"):
         try:
             importlib.import_module(mod)
-            print(f"module {mod:12s}: ok")
+            print(f"module {mod:10s}: ok")
         except Exception as e:
-            print(f"module {mod:12s}: MISSING ({e})")
+            print(f"module {mod:10s}: MISSING ({e})")
+
+    o = cfg.section("oxr")
+    mode = o.get("mode", default="free_api")
+    base = (o.get("base_url", default="")
+            or o.get("free_api_base_url" if mode == "free_api" else "local_base_url",
+                     default="https://free-oxr.somark.ai/api/v1"))
+    print(f"oxr mode   : {mode}")
+    print(f"oxr base   : {base}")
+    print(f"chunking   : max_pages={cfg.get('chunking', 'max_pages', default=20)} "
+          f"max_bytes={cfg.get('chunking', 'max_bytes', default=9437184)}")
     try:
-        from .ocr.tesseract_ocr import tesseract_available
-        print(f"tesseract binary: {'ok' if tesseract_available() else 'MISSING (apt-get install tesseract-ocr)'}")
+        r = requests.get(base, timeout=10)
+        print(f"oxr reach  : HTTP {r.status_code} (reachable)")
     except Exception as e:
-        print(f"tesseract binary: unknown ({e})")
-    print(f"refiner backend: {cfg.get('refiner', 'backend', default='gemma_local')}")
-    print(f"config source  : {layout.pipeline_json} (exists={layout.pipeline_json.exists()})")
+        hint = ("start the local OXR services, or set oxr.mode=free_api"
+                if mode == "local" else "check network/proxy")
+        print(f"oxr reach  : UNREACHABLE ({e}) — {hint}")
     return 0
 
 

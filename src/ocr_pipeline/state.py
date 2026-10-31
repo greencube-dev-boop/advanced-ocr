@@ -103,3 +103,25 @@ class StateStore:
             s = p.get("status", "pending")
             tally[s] = tally.get(s, 0) + 1
         return tally
+
+    # ---- OXR chunks (one /parse/sync request covering a page range) ----
+    def record_chunk(self, book: str, key: str, error: str | None = None) -> None:
+        entry = self.data["books"].get(book)
+        if entry is None:
+            return
+        c = entry.setdefault("chunks", {}).setdefault(key, {"attempts": 0, "last_error": None})
+        c["attempts"] = c.get("attempts", 0) + 1
+        c["last_error"] = error
+        c["updated_at"] = _now()
+        c["ok"] = error is None
+        entry["updated_at"] = _now()
+        self.save()
+
+    def chunk_attempts(self, book: str, key: str) -> int:
+        return int(self.book(book).get("chunks", {}).get(key, {}).get("attempts", 0))
+
+    # ---- reset ---------------------------------------------------------
+    def forget(self, book: str) -> None:
+        """Drop a book's whole state (used by `ocr_pipeline reset`)."""
+        self.data["books"].pop(book, None)
+        self.save()

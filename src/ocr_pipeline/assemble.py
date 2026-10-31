@@ -8,11 +8,11 @@ from pathlib import Path
 
 def assemble_book(book_temp_dir: Path, out_path: Path, title: str, meta: dict,
                   add_page_markers: bool = True, page_separator: str = "---") -> Path:
-    pages = sorted(book_temp_dir.glob("page-*.refined.md"))
+    pages = sorted(book_temp_dir.glob("page-*.final.md"))
     sep = f"\n\n{page_separator}\n\n"
     chunks: list[str] = []
     for p in pages:
-        m = re.match(r"page-(\d+)\.refined\.md$", p.name)
+        m = re.match(r"page-(\d+)\.final\.md$", p.name)
         no = int(m.group(1)) if m else 0
         body = p.read_text(encoding="utf-8").strip()
         if not body:
@@ -27,7 +27,7 @@ def assemble_book(book_temp_dir: Path, out_path: Path, title: str, meta: dict,
         f"- sha256: `{meta.get('sha256', '')}`",
         f"- pages processed: {len(pages)} (state: {counts})",
         f"- generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        "- pipeline: advanced-ocr",
+        "- pipeline: advanced-ocr v2 (OXR-1.0 via the SoMark API)",
         "",
     ])
     text = header + sep.join(chunks) + "\n"

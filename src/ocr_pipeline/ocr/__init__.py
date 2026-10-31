@@ -1,1 +1,1 @@
-"""OCR engines: Tesseract (local), nemotron-3.5-parse (NVIDIA API), suspicion scoring."""
+"""OXR-1.0 (SoMarkAI) client and JSON-blocks -> Markdown conversion."""

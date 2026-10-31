@@ -1,15 +1,14 @@
-"""Per-book processing pipeline with resume support.
+"""Per-book processing pipeline v2 (OXR-only) with resume support.
 
-Per page:
-  1. classify the page (text_only / visual / empty)
-  2. extract the native text layer          -> temp/<book>/page-XXXX.native.md
-  3. text_only: native text is the candidate, done
-     visual:    render PNG -> Tesseract OCR  -> temp/.../page-XXXX.ocr.md
-                suspicion check (confidence / garbage / mismatch / table)
-                if suspicious -> nemotron-3.5-parse escalation -> page-XXXX.nemotron.md
-  4. refine the candidate with the LLM      -> temp/.../page-XXXX.refined.md
-  5. mark the page done in books.json
-After all pages: assemble refined/<book>.md.
+Per book:
+  1. analyze every page (text_only / visual / empty)
+  2. text_only pages -> native PDF text layer is the final page markdown
+     empty pages     -> blank page markdown
+  3. visual pages -> grouped into contiguous chunks (<=20 pages AND <=9MiB;
+     an oversized single page is rendered to PNG) -> POST {oxr}/parse/sync
+     -> OXR JSON blocks -> per-page markdown
+  4. every finished page lands in temp/<book>/page-XXXX.final.md and books.json
+  5. assemble refined/<book>.md
 """
 from __future__ import annotations
 
@@ -19,40 +18,44 @@ from pathlib import Path
 
 from . import hashing
 from .assemble import assemble_book
-from .ocr import suspicion
-from .ocr.nemotron import NemotronClient, NemotronError
-from .ocr.nemotron_postprocess import postprocess as nemotron_postprocess
-from .ocr.tesseract_ocr import ocr_image, tesseract_available
+from .ocr.oxr_blocks import pages_to_markdown
+from .ocr.oxr_client import OxrClient, OxrError
 from .pdfutils.analyze import analyze_page
+from .pdfutils.chunking import paginate_range, split_range
 from .pdfutils.render import render_page_png
 from .pdfutils.text import extract_native_text
-from .refine.refiner import Refiner
 from .state import StateStore
 
 log = logging.getLogger("ocr_pipeline.pipeline")
 
 
 class Pipeline:
-    def __init__(self, layout, cfg, keys, state: StateStore, refiner: Refiner):
+    def __init__(self, layout, cfg, state: StateStore):
         self.layout = layout
         self.cfg = cfg
-        self.keys = keys
         self.state = state
-        self.refiner = refiner
-        self.nemotron: NemotronClient | None = None
-        nk = cfg.section("nemotron")
-        if keys.nvidia:
-            self.nemotron = NemotronClient(
-                api_key=keys.nvidia,
-                endpoint=nk.get("endpoint",
-                                default="https://ai.api.nvidia.com/v1/retrieval/nvidia/nemotron-3.5-parse/parse"),
-                max_output_tokens=nk.get("max_output_tokens", default=4096),
-                timeout=nk.get("timeout_sec", default=180),
-                max_retries=nk.get("max_retries", default=4),
-                backoff=nk.get("backoff_sec", default=5.0),
-            )
-        else:
-            log.warning("No NVIDIA_API_KEY in api.txt — nemotron escalation is disabled")
+        o = cfg.section("oxr")
+        self.mode = o.get("mode", default="free_api")
+        base = (o.get("base_url", default="")
+                or o.get("free_api_base_url" if self.mode == "free_api" else "local_base_url",
+                         default="https://free-oxr.somark.ai/api/v1"))
+        self.base_url = base
+        self.oxr = OxrClient(
+            base_url=base,
+            api_key=o.get("api_key", default=""),
+            timeout=o.get("timeout_sec", default=600),
+            max_retries=o.get("max_retries", default=5),
+            backoff=o.get("backoff_sec", default=10.0),
+            element_formats=o.get("element_formats", default=None),
+            feature_config=o.get("feature_config", default=None),
+            extra=o.get("extra", default=None),
+        )
+        c = cfg.section("chunking")
+        self.max_pages = int(c.get("max_pages", default=20))
+        self.max_bytes = int(c.get("max_bytes", default=9437184))
+        self.render_dpi = int(c.get("render_dpi", default=200))
+        self.chunk_retries = int(c.get("chunk_retries", default=3))
+        self.figure_marker = bool(cfg.get("output", "figure_marker", default=False))
 
     # ------------------------------------------------------------------
     def run_all(self) -> dict:
@@ -60,10 +63,7 @@ class Pipeline:
         if not pdfs:
             log.info("No PDFs in %s — drop raw PDFs into raw/ and rerun.", self.layout.raw)
             return {}
-        summary = {}
-        for pdf in pdfs:
-            summary[pdf.name] = self.run_book(pdf)
-        return summary
+        return {pdf.name: self.run_book(pdf) for pdf in pdfs}
 
     def run_book(self, pdf_path: Path) -> dict:
         import fitz  # PyMuPDF — imported lazily so pure modules stay testable
@@ -80,21 +80,32 @@ class Pipeline:
         btemp = self.layout.book_temp(stem)
         btemp.mkdir(parents=True, exist_ok=True)
 
-        tess_ok = self.cfg.get("tesseract", "enabled", default=True) and tesseract_available()
-        if not tess_ok:
-            log.warning("Tesseract unavailable — visual pages will go native-text -> nemotron only")
-        dpi = self.cfg.get("pdf_render_dpi", default=200)
+        pcfg = self.cfg.section("page")
+        infos = [
+            analyze_page(doc[i], i + 1,
+                         min_text_chars=pcfg.get("min_text_chars", default=20),
+                         dense_drawings=pcfg.get("dense_drawings", default=40),
+                         large_image_area_ratio=pcfg.get("large_image_area_ratio", default=0.01))
+            for i in range(total)
+        ]
 
-        for page_no in range(1, total + 1):
+        # phase 1: text-only pages need no OXR at all (exact native text layer)
+        for page_no, info in enumerate(infos, start=1):
             if self.state.page(name, page_no).get("status") == "done":
-                continue  # resume: skip finished pages
-            try:
-                self._process_page(doc, name, btemp, page_no, total, tess_ok, dpi)
-            except Exception as e:
-                log.exception("Page %d of %s failed: %s", page_no, name, e)
-                self.state.set_page(name, page_no, "error", error=str(e))
-        doc.close()
+                continue
+            if info.kind == "text_only":
+                self._finish_native(doc[page_no - 1], name, btemp, page_no, total, info)
+            elif info.kind == "empty":
+                self._finish_blank(name, btemp, page_no, total, info)
 
+        # phase 2: remaining (visual) pages go through OXR in adaptive chunks
+        pending = [p for p in range(1, total + 1)
+                   if self.state.page(name, p).get("status") != "done"]
+        for a0, b0 in _contiguous(pending):        # inclusive 0-based
+            for ca, cb, payload, kind in self._build_chunks(doc, a0, b0):
+                self._process_chunk(name, btemp, ca, cb, payload, kind, total)
+
+        doc.close()
         counts = self.state.counts(name)
         out = self.layout.refined / f"{stem}.md"
         assemble_book(btemp, out, stem,
@@ -107,97 +118,112 @@ class Pipeline:
         return {"book": name, "output": str(out), "status": status, "counts": counts}
 
     # ------------------------------------------------------------------
-    def _process_page(self, doc, book: str, btemp: Path, page_no: int, total: int,
-                      tess_ok: bool, dpi: int) -> None:
-        page = doc[page_no - 1]
-        pbase = btemp / f"page-{page_no:04d}"
-        pcfg = self.cfg.section("page")
-
-        info = analyze_page(
-            page, page_no,
-            min_text_chars=pcfg.get("min_text_chars", default=20),
-            dense_drawings=pcfg.get("dense_drawings", default=40),
-            large_image_area_ratio=pcfg.get("large_image_area_ratio", default=0.01),
-        )
+    def _finish_native(self, page, book: str, btemp: Path, page_no: int, total: int, info) -> None:
         native = extract_native_text(page)
-        pbase.with_suffix(".native.md").write_text(native, encoding="utf-8")
+        pbase = btemp / f"page-{page_no:04d}"
+        pbase.with_suffix(".final.md").write_text(native, encoding="utf-8")
+        self._write_meta(pbase, {"page": page_no, "kind": info.kind, "engine": "native",
+                                 "chars": len(native)})
+        self.state.set_page(book, page_no, "done", engine="native", extra={"kind": info.kind})
+        log.info("page %d/%d [%s] engine=native", page_no, total, info.kind)
 
-        engines: list[str] = []
-        candidate = native
-        ocr_text, mean_conf = "", None
-        susp_reasons: list[str] = []
-        nemo_md = ""
+    def _finish_blank(self, book: str, btemp: Path, page_no: int, total: int, info) -> None:
+        pbase = btemp / f"page-{page_no:04d}"
+        pbase.with_suffix(".final.md").write_text("", encoding="utf-8")
+        self._write_meta(pbase, {"page": page_no, "kind": info.kind, "engine": "none", "chars": 0})
+        self.state.set_page(book, page_no, "done", engine="none", extra={"kind": info.kind})
+        log.info("page %d/%d [%s] engine=none (blank)", page_no, total, info.kind)
 
-        if info.kind == "text_only":
-            engines.append("native")
-        else:
-            png = render_page_png(page, dpi=dpi)
-            pbase.with_suffix(".png").write_bytes(png)
-            if tess_ok:
-                tcfg = self.cfg.section("tesseract")
-                res = ocr_image(png, lang=tcfg.get("lang", default="eng"),
-                                psm=tcfg.get("psm", default=3))
-                ocr_text, mean_conf = res.text, res.mean_conf
-                pbase.with_suffix(".ocr.md").write_text(ocr_text, encoding="utf-8")
-                engines.append("tesseract")
+    # ---- chunk building ------------------------------------------------
+    def _serialize(self, doc, a: int, b: int) -> bytes:
+        import fitz
 
-            suspicious, susp_reasons = suspicion.evaluate(
-                native, ocr_text, mean_conf,
-                has_table=info.has_table or info.has_dense_drawings,
-                cfg=self.cfg,
-            )
-            if suspicious and self.nemotron is not None:
-                try:
-                    raw = self.nemotron.parse_page(png, mime="image/png")
-                    nemo_md = nemotron_postprocess(
-                        raw.get("content", ""),
-                        table_format=self.cfg.get("nemotron", "table_format", default="markdown"),
-                    )
-                    pbase.with_suffix(".nemotron.md").write_text(nemo_md, encoding="utf-8")
-                    engines.append("nemotron")
-                except NemotronError as e:
-                    log.warning("page %d: nemotron failed (%s) — falling back", page_no, e)
-                    susp_reasons.append(f"nemotron-error:{e}")
+        out = fitz.open()
+        try:
+            out.insert_pdf(doc, from_page=a, to_page=b)
+            return out.tobytes(deflate=True, garbage=3)
+        finally:
+            out.close()
 
-            if nemo_md:
-                candidate = nemo_md                       # vision parse wins on hard pages
-            elif suspicious:
-                candidate = ocr_text or native            # tesseract is the fallback
-            elif native.strip():
-                candidate = native                        # text layer was reliable
+    def _build_chunks(self, doc, a: int, b: int):
+        """Yield (ca, cb, payload, kind) pieces covering [a, b] (inclusive 0-based)."""
+        for ca, cb in paginate_range(a, b, self.max_pages):
+            for piece in self._size_split(doc, ca, cb):
+                yield piece
+
+    def _size_split(self, doc, a: int, b: int):
+        data = self._serialize(doc, a, b)
+        if len(data) <= self.max_bytes:
+            return [(a, b, data, "pdf")]
+        if a == b:
+            # a single page too big for the free-API limit -> send a rendered PNG
+            log.warning("page %d exceeds %d bytes as PDF; sending rendered PNG instead",
+                        a + 1, self.max_bytes)
+            return [(a, b, render_page_png(doc[a], dpi=self.render_dpi), "image")]
+        mid = (a + b) // 2
+        return self._size_split(doc, a, mid) + self._size_split(doc, mid + 1, b)
+
+    # ---- chunk processing ----------------------------------------------
+    def _process_chunk(self, book: str, btemp: Path, ca: int, cb: int,
+                       payload: bytes, kind: str, total: int) -> None:
+        chunk_key = f"p{ca + 1:04d}-{cb + 1:04d}"
+        if self.state.chunk_attempts(book, chunk_key) >= self.chunk_retries:
+            for p in range(ca + 1, cb + 2):
+                if self.state.page(book, p).get("status") != "done":
+                    self.state.set_page(book, p, "error",
+                                        error=f"chunk {chunk_key} failed {self.chunk_retries}+ times")
+            return
+        try:
+            if kind == "pdf":
+                resp = self.oxr.parse(payload, filename=f"{chunk_key}.pdf", mime="application/pdf")
             else:
-                candidate = ocr_text                      # scanned page, no text layer
-            if "nemotron" not in engines and info.kind == "visual":
-                engines.append("native" if native.strip() else "ocr-only")
+                resp = self.oxr.parse(payload, filename=f"{chunk_key}.png", mime="image/png")
+            outputs = ((resp.get("data") or {}).get("result") or {}).get("outputs") or {}
+            pages_json = (outputs.get("json") or {}).get("pages")
+            if not pages_json:
+                raise OxrError("response carries no JSON pages output")
+            (btemp / f"{chunk_key}.oxr.json").write_text(
+                json.dumps(outputs.get("json"), ensure_ascii=False), encoding="utf-8")
+            if outputs.get("markdown"):
+                (btemp / f"{chunk_key}.oxr.md").write_text(
+                    str(outputs["markdown"]), encoding="utf-8")
 
-        # ---- refine ---------------------------------------------------
-        refined, refiner_engine = candidate, "none"
-        if self.cfg.get("refiner", "enabled", default=True) and self.refiner is not None:
-            if self.refiner.available():
-                try:
-                    refined, refiner_engine = self.refiner.refine_page(candidate, page_no, total)
-                except Exception as e:
-                    log.warning("page %d: refinement failed (%s); keeping pre-refine text",
-                                page_no, e)
-                    refined, refiner_engine = candidate, "refine-failed"
-            elif self.cfg.get("refiner", "skip_if_unavailable", default=True):
-                log.warning("page %d: refiner backend unavailable; keeping pre-refine text", page_no)
+            md_by_page = pages_to_markdown(pages_json, page_base=ca)
+            for p in range(ca + 1, cb + 2):
+                if p not in md_by_page:
+                    log.warning("chunk %s: OXR returned no blocks for page %d — left pending",
+                                chunk_key, p)
+                    continue
+                pbase = btemp / f"page-{p:04d}"
+                pbase.with_suffix(".final.md").write_text(md_by_page[p], encoding="utf-8")
+                self._write_meta(pbase, {"page": p, "kind": "visual", "engine": f"oxr:{self.mode}",
+                                         "chunk": chunk_key, "chars": len(md_by_page[p])})
+                self.state.set_page(book, p, "done", engine=f"oxr:{self.mode}",
+                                    extra={"chunk": chunk_key})
+            self.state.record_chunk(book, chunk_key, error=None)
+            log.info("chunk %s ok (engine=oxr:%s, %d pages)", chunk_key, self.mode, cb - ca + 1)
+        except Exception as e:
+            self.state.record_chunk(book, chunk_key, error=str(e))
+            log.warning("chunk %s failed: %s", chunk_key, e)
 
-        pbase.with_suffix(".refined.md").write_text(refined, encoding="utf-8")
-        meta = {
-            "page": page_no,
-            "kind": info.kind,
-            "info": info.to_dict(),
-            "engines": engines,
-            "suspicion": susp_reasons,
-            "refiner": refiner_engine,
-            "chars_in": len(candidate),
-            "chars_out": len(refined),
-        }
+    @staticmethod
+    def _write_meta(pbase: Path, meta: dict) -> None:
         pbase.with_suffix(".meta.json").write_text(
             json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-        self.state.set_page(book, page_no, "done", engine="+".join(engines),
-                            extra={"kind": info.kind, "refiner": refiner_engine,
-                                   "suspicion": susp_reasons})
-        log.info("page %d/%d [%s] engines=%s refiner=%s suspicion=%s",
-                 page_no, total, info.kind, "+".join(engines), refiner_engine, susp_reasons)
+
+
+def _contiguous(pages: list[int]) -> list[tuple[int, int]]:
+    """[3,4,5,8] (1-based) -> [(2,4), (7,7)] inclusive 0-based ranges."""
+    if not pages:
+        return []
+    ranges: list[tuple[int, int]] = []
+    start = prev = pages[0] - 1
+    for p in pages[1:]:
+        p0 = p - 1
+        if p0 == prev + 1:
+            prev = p0
+        else:
+            ranges.append((start, prev))
+            start = prev = p0
+    ranges.append((start, prev))
+    return ranges

@@ -1,13 +1,11 @@
 # Core pipeline (installed by the Colab runner)
-PyMuPDF>=1.24          # PDF page analysis, rendering, native text
-pytesseract>=0.3.10    # Tesseract wrapper (binary itself: apt-get install tesseract-ocr)
-Pillow>=10.0           # image handling for pytesseract
-requests>=2.31         # nemotron + gemini REST clients
+PyMuPDF>=1.24          # PDF page analysis, native text, chunk building, page rendering
+requests>=2.31         # OXR /parse/sync client
 tqdm>=4.66
 
-# Keyless refiner backend (Gemma 3 on the Colab GPU). torch is preinstalled on Colab.
-transformers>=4.44
-accelerate>=0.33
-bitsandbytes>=0.43
-
-# The gemini_api refiner backend needs only `requests` (key filled in later).
+# No OCR/LLM dependencies: SoMarkAI/OXR-1.0 handles tables, formulas, chemistry and
+# code natively. The default mode uses the free OXR API (no key).
+#
+# Self-hosting OXR locally (oxr.mode="local") needs its own stack (vLLM + plugin +
+# layout service, >=24GB BF16 GPU) — see https://github.com/SoMarkAI/OXR — but the
+# pipeline itself only talks HTTP to it, so nothing extra is required here.

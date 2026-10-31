@@ -1,36 +1,48 @@
-# Advanced OCR
+# Advanced OCR (v2 — OXR-1.0)
 
-PDF book → clean, single Markdown file. Runs on **Google Colab** (free GPU), keeps **all code in this GitHub repo** and **all data in Google Drive**, and is fully **resumable** — stop anytime, rerun, continue where it left off.
+PDF book → clean, single Markdown file. Runs on **Google Colab**, keeps **all code in this GitHub repo** and **all data in Google Drive**, and is fully **resumable** — stop anytime, rerun, continue where it left off.
+
+v2 replaces the v1 engine stack (Tesseract + nemotron-3.5-parse + LLM refiner) with **[SoMarkAI/OXR-1.0](https://github.com/SoMarkAI/OXR)**, a 1.3B document-parsing model that natively emits Markdown — tables (Markdown/HTML), formulas (LaTeX), chemical equations (mhchem), chemical structures (SMILES), code blocks, titles and reading order. **No API keys are needed at all.**
 
 ## Architecture
 
 ```
 raw PDF (Drive: OCR Engine/raw/*.pdf)
-   │  page-by-page loop (PyMuPDF)
+   │  page-by-page analysis (PyMuPDF)
    ▼
-page classification ── text_only ──► native text layer ─────────────┐
-   │ visual (images/tables/flowcharts)                              │
-   ▼                                                               ▼
-render page PNG ─► Tesseract OCR ─► suspicion check ──clean──► native text
-                                        │ suspicious / table
-                                        ▼
-                              nemotron-3.5-parse (NVIDIA API, escalation)
-                                        │
-                                        ▼
-                              LLM refinement (keyless Gemma 3 on Colab GPU by default,
-                              or Gemini API when a key is filled in)
-                                        │
-                                        ▼
-                              temp/<book>/page-XXXX.refined.md
-                                        │
-                                        ▼
-                              refined/<book>.md   (one combined Markdown per book)
+page classification
+   ├─ text_only ──► native text layer (exact, free, no OCR) ──────────────┐
+   ├─ empty ──────► blank page ───────────────────────────────────────────┤
+   └─ visual ─────► contiguous pending pages → adaptive chunks
+                    (≤20 pages AND ≤9 MiB per chunk; oversized single page
+                     → rendered 200dpi PNG)
+                    → POST {oxr}/parse/sync (output_formats=json)
+                    → OXR JSON blocks → per-page Markdown ─────────────────┤
+                                                                           ▼
+                                                refined/<book>.md  (one combined Markdown)
 ```
 
-- **Text-only pages** never touch OCR — the PDF text layer is exact.
-- **Visual pages**: native text is kept, the page is rendered to PNG, Tesseract runs as a cross-check. If Tesseract's output looks suspicious (low confidence, garbage characters, big length mismatch with the native text) **or a table/diagram is detected**, the page is escalated to **nemotron-3.5-parse**, whose output (tables come back as LaTeX `tabular`, converted to Markdown tables) wins.
-- **Refinement** turns the raw per-page content into clean Markdown: tables → Markdown tables, equations → LaTeX (`$...$` / `$$...$$`), flowcharts → numbered steps or `mermaid` blocks, OCR noise removed. Figures without extractable text are ignored. Original language is preserved.
-- **Resume**: state lives in `OCR Engine/config/books.json`. A page is only marked `done` after its refined file is on disk, so rerunning the notebook simply redoes the unfinished pages. If a PDF changes on disk (sha256 mismatch), its page states reset.
+**OXR element handling** (per page, from the `json` output):
+
+| OXR element | Goes into the Markdown as |
+| --- | --- |
+| Title | `#`-heading (uses OXR's `title_level`) |
+| Text / Caption / Footnote / Stamp | plain paragraph |
+| Table | Markdown table (element_formats `table=markdown`) |
+| Formula | `$$…$$` LaTeX |
+| Chemical Equation | `$$\ce{…}$$` mhchem LaTeX |
+| Chemical Structure | SMILES inline code |
+| Code Block | fenced code block |
+| Picture | dropped (OXR's API has no image understanding; non-textifiable images are ignored) — or `*[figure omitted]*` marker with `output.figure_marker: true` |
+| Page header/footer | dropped (`keep_header_footer: false`) |
+
+> Note: unlike the v1 Gemini-refiner path, flowcharts/diagrams that are pure graphics cannot be converted to text any more — OXR's API does not support image understanding. Everything with textual content (tables, formulas, chemistry, code) is captured as text.
+
+## OXR modes (`oxr.mode` in the Drive config)
+
+- **`free_api`** (default): `https://free-oxr.somark.ai/api/v1` — **no key, no sign-up**. Limits per request: 10 MB / 20 pages (our chunker respects both; single oversized pages are sent as rendered PNGs), requests are queued and best-effort. Works on any Colab runtime, CPU included.
+- **`local`** (self-hosted OXR): point `base_url` (or `oxr.local_base_url`) at your own OXR service, e.g. `http://127.0.0.1:8000/v1` — same SoMark-compatible `/parse/sync` contract, no limits. Requirements per the [OXR repo](https://github.com/SoMarkAI/OXR): Linux, **NVIDIA GPU ≥24 GB with BF16** (a free Colab T4 does NOT qualify; Colab Pro A100/L4-class does), CUDA 13.0 driver, Python 3.12. Deployment: Docker all-in-one, or the three-service source setup (vLLM + out-of-tree plugin on :8080, layout model on :8081, `oxr serve` on :8000).
+- `oxr.base_url` overrides whichever mode default; `oxr.api_key` stays `dummy` unless you aim it at SoMark production.
 
 ## Drive layout
 
@@ -43,72 +55,45 @@ OCR Engine/
   refined/     final output: mybook.md
   temp/        per-book working files:
     mybook/
-      page-0001.native.md     PDF text layer
-      page-0001.png           rendered page image
-      page-0001.ocr.md        Tesseract output
-      page-0001.nemotron.md   nemotron-3.5-parse output (post-processed)
-      page-0001.refined.md    final per-page Markdown
-      page-0001.meta.json     decision trail (kind, engines, suspicion reasons)
+      p0001-0020.oxr.json     OXR JSON output (per-chunk source of truth)
+      p0001-0020.oxr.md       OXR markdown output (debug reference)
+      page-0001.final.md      final per-page Markdown (from native text or OXR)
+      page-0001.meta.json     decision trail (kind, engine, chunk, chars)
 ```
-
-## Setup (once)
-
-1. Open `notebooks/colab_runner.ipynb` from this repo in Colab (*File → Open notebook → GitHub*, or "Open in Colab" badge).
-2. Run the **install** cell and the **mount Drive** cell.
-3. Run the **sync repo** cell. The repo is private — either paste a GitHub PAT (read access) into the `GITHUB_TOKEN` cell variable, or make the repo public.
-4. Run the **api.txt** cell and upload your `api.txt`:
-   ```
-   nvapi-...            <- line 1: NVIDIA key (nemotron-3.5-parse)
-   GEMINI_API_KEY=...   <- optional, only if you later want the Gemini backend
-   HF_TOKEN=...         <- optional, only if your HF account hasn't accepted the Gemma license
-   ```
-   The file is used only in the Colab runtime — it is never written to Drive or git.
-5. Put PDFs into **Drive → `OCR Engine/raw/`**.
-6. Run `doctor` to verify everything, then `run`.
 
 ## Usage on Colab
 
-The notebook cells call the CLI (all code comes from the repo via `git pull`, so pushing updates to GitHub is enough — never re-upload the notebook):
+Open `notebooks/colab_runner.ipynb` from this repo in Colab and run the cells top to bottom: install deps → mount Drive → sync repo (`git pull`, so pushing updates to GitHub is enough — never re-upload the notebook) → `doctor` → `run`. Drop PDFs into **Drive → `OCR Engine/raw/`** first.
+
+The notebook cells call the CLI:
 
 ```bash
-python -m ocr_pipeline doctor        --drive-root "/content/drive/MyDrive/OCR Engine" --api-file /content/api.txt
+python -m ocr_pipeline doctor        --drive-root "/content/drive/MyDrive/OCR Engine"
 python -m ocr_pipeline init-config   --drive-root ...   # once: write default settings to Drive
 python -m ocr_pipeline status        --drive-root ...   # show resume state
 python -m ocr_pipeline run           --drive-root ...   # process all pending PDFs (resumable)
 python -m ocr_pipeline run-book mybook.pdf --drive-root ...
+python -m ocr_pipeline reset mybook.pdf    --drive-root ...   # forget state + temp, reprocess from scratch
 ```
 
-Outputs:
-
-- combined book: `Drive/OCR Engine/refined/<book>.md`
-- per-page trail: `Drive/OCR Engine/temp/<book>/`
-- state: `Drive/OCR Engine/config/books.json`
-
-To **resume after a disconnect**: just rerun the same notebook cells — finished pages are skipped.
-
-## Refiner backends (no keyless Gemini exists)
-
-Google's Gemini API strictly requires an API key (even the free tier), and Hugging Face inference is token-gated too. The default backend is therefore:
-
-- **`gemma_local`** (default, keyless): `google/gemma-3-4b-it` in 4-bit (~3 GB VRAM) on the Colab T4 GPU via `transformers`. ~1–2 min/page, unattended overnight runs are fine thanks to resume. No key of any kind.
-- **`gemini_api`**: implemented and ready — set `refiner.backend = "gemini_api"` in `config/pipeline.json` and put `GEMINI_API_KEY=...` in api.txt (or `api_key` in the config). The key slot is intentionally left empty for now. Free tier ≈ 15 RPM; the client self-throttles via `rpm`.
-
-Switch backends by editing `OCR Engine/config/pipeline.json` on Drive — no code changes needed.
-
-## OCR escalation order (per page)
-
-`native text → Tesseract → nemotron-3.5-parse (only if tables/diagrams detected or Tesseract output suspicious)`
-
-Suspicion triggers are configurable under `suspicion` in `pipeline.json` (min word confidence, garbage-char ratio, native-vs-OCR length mismatch). Tesseract language is configurable (`tesseract.lang`, e.g. `"eng+ben"`).
+- **Resume**: state lives in `OCR Engine/config/books.json`. A page is only marked `done` after its final markdown is on disk, so rerunning redoes only the unfinished pages. Failed OXR chunks are retried on the next run (up to `chunking.chunk_retries`, then the pages are marked `error`). If a PDF changes on disk (sha256 mismatch), its page states reset.
+- **Upgrading from v1**: books processed by v1 keep their old states. To reprocess a book with OXR, run `reset <book>` and rerun.
 
 ## Config reference
 
-See `config/pipeline.example.json` — the same content is written to Drive by `init-config`. Notable knobs: `pdf_render_dpi`, `nemotron.max_output_tokens` (API ceiling 9000), `nemotron.table_format` (`markdown` | `latex`), `refiner.*`, `output.*`.
+See `config/pipeline.example.json` (same content as what `init-config` writes to Drive). Notable knobs:
+
+- `oxr.mode`, `oxr.base_url` — free API vs self-hosted (see above)
+- `oxr.element_formats` — `image: none|base64|url`, `formula: latex`, `table: markdown|html`, `cs: smiles|image`
+- `oxr.extra` — OXR-only sampling: `temperature` / `top_p` / `repetition_penalty`
+- `chunking.max_pages` (free-API ceiling 20), `chunking.max_bytes` (ceiling 10 MB), `chunking.render_dpi`, `chunking.chunk_retries`
+- `page.*` — text_only / visual / empty classification thresholds
+- `output.figure_marker` — emit `*[figure omitted]*` where a picture was dropped
 
 ## Local development
 
 ```bash
-pip install -r requirements.txt   # plus: apt-get install tesseract-ocr
+pip install -r requirements.txt
 python -m unittest discover -s tests -v     # stdlib-only unit tests
-python -m ocr_pipeline doctor --drive-root "/path/to/OCR Engine" --api-file api.txt
+python -m ocr_pipeline doctor --drive-root "/path/to/OCR Engine"
 ```
