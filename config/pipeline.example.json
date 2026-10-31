@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "oxr": {
     "mode": "free_api",
     "base_url": "",
@@ -27,11 +27,6 @@
     "max_bytes": 9437184,
     "render_dpi": 200,
     "chunk_retries": 3
-  },
-  "page": {
-    "min_text_chars": 20,
-    "dense_drawings": 40,
-    "large_image_area_ratio": 0.01
   },
   "output": {
     "add_page_markers": true,

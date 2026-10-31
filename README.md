@@ -1,25 +1,20 @@
-# Advanced OCR (v2 — OXR-1.0)
+# Advanced OCR (v3 — 100% OXR-1.0)
 
 PDF book → clean, single Markdown file. Runs on **Google Colab**, keeps **all code in this GitHub repo** and **all data in Google Drive**, and is fully **resumable** — stop anytime, rerun, continue where it left off.
 
-v2 replaces the v1 engine stack (Tesseract + nemotron-3.5-parse + LLM refiner) with **[SoMarkAI/OXR-1.0](https://github.com/SoMarkAI/OXR)**, a 1.3B document-parsing model that natively emits Markdown — tables (Markdown/HTML), formulas (LaTeX), chemical equations (mhchem), chemical structures (SMILES), code blocks, titles and reading order. **No API keys are needed at all.**
+v3 uses **[SoMarkAI/OXR-1.0](https://github.com/SoMarkAI/OXR)**, a 1.3B document-parsing model, as the **only** engine: **every page of every PDF is parsed by OXR** (the native PDF text layer is not used at all), so the whole book gets uniform OXR structure — tables (Markdown), formulas (LaTeX `$$…$$`), chemical equations (mhchem), chemical structures (SMILES), code blocks, titles and reading order. **No API keys are needed at all.**
 
 ## Architecture
 
 ```
 raw PDF (Drive: OCR Engine/raw/*.pdf)
-   │  page-by-page analysis (PyMuPDF)
+   │  100% of pages go to OXR (page-level resume in books.json)
    ▼
-page classification
-   ├─ text_only ──► native text layer (exact, free, no OCR) ──────────────┐
-   ├─ empty ──────► blank page ───────────────────────────────────────────┤
-   └─ visual ─────► contiguous pending pages → adaptive chunks
-                    (≤20 pages AND ≤9 MiB per chunk; oversized single page
-                     → rendered 200dpi PNG)
-                    → POST {oxr}/parse/sync (output_formats=json)
-                    → OXR JSON blocks → per-page Markdown ─────────────────┤
-                                                                           ▼
-                                                refined/<book>.md  (one combined Markdown)
+pending pages → contiguous chunks (≤20 pages AND ≤9 MiB per chunk;
+                an oversized single page → rendered 200dpi PNG)
+   → POST {oxr}/parse/sync (output_formats=json)
+   → OXR JSON blocks → per-page Markdown (temp/<book>/page-XXXX.final.md)
+   → refined/<book>.md   (one combined Markdown per book)
 ```
 
 **OXR element handling** (per page, from the `json` output):
@@ -77,7 +72,7 @@ python -m ocr_pipeline reset mybook.pdf    --drive-root ...   # forget state + t
 ```
 
 - **Resume**: state lives in `OCR Engine/config/books.json`. A page is only marked `done` after its final markdown is on disk, so rerunning redoes only the unfinished pages. Failed OXR chunks are retried on the next run (up to `chunking.chunk_retries`, then the pages are marked `error`). If a PDF changes on disk (sha256 mismatch), its page states reset.
-- **Upgrading from v1**: books processed by v1 keep their old states. To reprocess a book with OXR, run `reset <book>` and rerun.
+- **Upgrading from v1/v2**: books processed by earlier versions keep their old states (v2 pages extracted natively stay native). To re-convert a book 100% with OXR, run `reset <book>` and rerun.
 
 ## Config reference
 
@@ -87,7 +82,6 @@ See `config/pipeline.example.json` (same content as what `init-config` writes to
 - `oxr.element_formats` — `image: none|base64|url`, `formula: latex`, `table: markdown|html`, `cs: smiles|image`
 - `oxr.extra` — OXR-only sampling: `temperature` / `top_p` / `repetition_penalty`
 - `chunking.max_pages` (free-API ceiling 20), `chunking.max_bytes` (ceiling 10 MB), `chunking.render_dpi`, `chunking.chunk_retries`
-- `page.*` — text_only / visual / empty classification thresholds
 - `output.figure_marker` — emit `*[figure omitted]*` where a picture was dropped
 
 ## Local development

@@ -1,1 +1,1 @@
-"""PDF page inspection: classification, rendering, native text extraction."""
+"""PDF helpers: adaptive OXR chunking and page rendering (oversized-page fallback)."""

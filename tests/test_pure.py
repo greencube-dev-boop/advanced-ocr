@@ -21,11 +21,11 @@ class TestCfg(unittest.TestCase):
         a = deep_merge({"a": {"b": 1, "c": 2}}, {"a": {"b": 9}})
         self.assertEqual(a, {"a": {"b": 9, "c": 2}})
 
-    def test_defaults_have_v2_sections(self):
-        for sec in ("oxr", "chunking", "page", "output"):
+    def test_defaults_have_v3_sections(self):
+        for sec in ("oxr", "chunking", "output"):
             self.assertIn(sec, DEFAULTS)
-        # v1 engines are gone
-        for gone in ("tesseract", "nemotron", "suspicion", "refiner"):
+        # v1 engines and the v2 native-text fast path are gone
+        for gone in ("tesseract", "nemotron", "suspicion", "refiner", "page"):
             self.assertNotIn(gone, DEFAULTS)
 
     def test_default_mode_is_free_api(self):

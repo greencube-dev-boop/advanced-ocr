@@ -27,7 +27,7 @@ def assemble_book(book_temp_dir: Path, out_path: Path, title: str, meta: dict,
         f"- sha256: `{meta.get('sha256', '')}`",
         f"- pages processed: {len(pages)} (state: {counts})",
         f"- generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        "- pipeline: advanced-ocr v2 (OXR-1.0 via the SoMark API)",
+        "- pipeline: advanced-ocr v3 (100% OXR-1.0 via the SoMark API)",
         "",
     ])
     text = header + sep.join(chunks) + "\n"

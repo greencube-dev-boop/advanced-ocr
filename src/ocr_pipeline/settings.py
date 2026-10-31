@@ -1,8 +1,9 @@
 """Runtime configuration: packaged DEFAULTS merged with Drive config/pipeline.json.
 
-v2 (OXR-only): SoMarkAI/OXR-1.0 replaces Tesseract, nemotron-3.5-parse and the
-LLM refiner. Defaults live here; `ocr_pipeline init-config` copies them to
-<drive>/config/pipeline.json, and from then on the Drive copy wins (deep-merged).
+v3 (100% OXR): every page of every PDF is parsed by SoMarkAI/OXR-1.0 — the
+native text layer is not used. Defaults live here; `ocr_pipeline init-config`
+copies them to <drive>/config/pipeline.json, and from then on the Drive copy
+wins (deep-merged).
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import json
 from pathlib import Path
 
 DEFAULTS: dict = {
-    "version": 2,
+    "version": 3,
     "oxr": {
         "mode": "free_api",      # free_api (no key, 10MB/20-pages per request) | local (self-hosted)
         "base_url": "",          # explicit override; empty -> per-mode default below
@@ -32,11 +33,6 @@ DEFAULTS: dict = {
         "max_bytes": 9437184,    # 9 MiB, under the 10MB free-API ceiling
         "render_dpi": 200,       # fallback rendering when a single page exceeds max_bytes
         "chunk_retries": 3,      # failed chunks are retried on the next run, up to this
-    },
-    "page": {
-        "min_text_chars": 20,        # below this the native text layer counts as empty
-        "dense_drawings": 40,        # vector drawing count that marks a flowchart/diagram page
-        "large_image_area_ratio": 0.01,  # raster images bigger than 1% of the page count as visuals
     },
     "output": {
         "add_page_markers": True,    # <!-- page N --> comments in the combined md

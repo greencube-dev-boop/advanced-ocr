@@ -1,29 +1,27 @@
-"""Per-book processing pipeline v2 (OXR-only) with resume support.
+"""Per-book processing pipeline (OXR-only, 100% coverage) with resume support.
+
+Every page of every PDF is parsed by OXR-1.0 — the native text layer is not
+used at all, so the whole book gets uniform OXR structure (headings, tables,
+LaTeX formulas, mhchem, SMILES, code fences).
 
 Per book:
-  1. analyze every page (text_only / visual / empty)
-  2. text_only pages -> native PDF text layer is the final page markdown
-     empty pages     -> blank page markdown
-  3. visual pages -> grouped into contiguous chunks (<=20 pages AND <=9MiB;
-     an oversized single page is rendered to PNG) -> POST {oxr}/parse/sync
-     -> OXR JSON blocks -> per-page markdown
-  4. every finished page lands in temp/<book>/page-XXXX.final.md and books.json
-  5. assemble refined/<book>.md
+  1. all not-yet-done pages are grouped into contiguous chunks
+     (<=20 pages AND <=9MiB per chunk; an oversized single page is rendered
+     to PNG) -> POST {oxr}/parse/sync -> OXR JSON blocks -> per-page markdown
+  2. every finished page lands in temp/<book>/page-XXXX.final.md and books.json
+  3. assemble refined/<book>.md
 """
 from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 
 from . import hashing
 from .assemble import assemble_book
 from .ocr.oxr_blocks import pages_to_markdown
 from .ocr.oxr_client import OxrClient, OxrError
-from .pdfutils.analyze import analyze_page
 from .pdfutils.chunking import paginate_range, split_range
 from .pdfutils.render import render_page_png
-from .pdfutils.text import extract_native_text
 from .state import StateStore
 
 log = logging.getLogger("ocr_pipeline.pipeline")
@@ -65,7 +63,7 @@ class Pipeline:
             return {}
         return {pdf.name: self.run_book(pdf) for pdf in pdfs}
 
-    def run_book(self, pdf_path: Path) -> dict:
+    def run_book(self, pdf_path) -> dict:
         import fitz  # PyMuPDF — imported lazily so pure modules stay testable
 
         name = pdf_path.name
@@ -80,30 +78,12 @@ class Pipeline:
         btemp = self.layout.book_temp(stem)
         btemp.mkdir(parents=True, exist_ok=True)
 
-        pcfg = self.cfg.section("page")
-        infos = [
-            analyze_page(doc[i], i + 1,
-                         min_text_chars=pcfg.get("min_text_chars", default=20),
-                         dense_drawings=pcfg.get("dense_drawings", default=40),
-                         large_image_area_ratio=pcfg.get("large_image_area_ratio", default=0.01))
-            for i in range(total)
-        ]
-
-        # phase 1: text-only pages need no OXR at all (exact native text layer)
-        for page_no, info in enumerate(infos, start=1):
-            if self.state.page(name, page_no).get("status") == "done":
-                continue
-            if info.kind == "text_only":
-                self._finish_native(doc[page_no - 1], name, btemp, page_no, total, info)
-            elif info.kind == "empty":
-                self._finish_blank(name, btemp, page_no, total, info)
-
-        # phase 2: remaining (visual) pages go through OXR in adaptive chunks
+        # every not-yet-done page goes through OXR — no native-text fast path
         pending = [p for p in range(1, total + 1)
                    if self.state.page(name, p).get("status") != "done"]
         for a0, b0 in _contiguous(pending):        # inclusive 0-based
             for ca, cb, payload, kind in self._build_chunks(doc, a0, b0):
-                self._process_chunk(name, btemp, ca, cb, payload, kind, total)
+                self._process_chunk(name, btemp, ca, cb, payload, kind)
 
         doc.close()
         counts = self.state.counts(name)
@@ -118,23 +98,6 @@ class Pipeline:
         return {"book": name, "output": str(out), "status": status, "counts": counts}
 
     # ------------------------------------------------------------------
-    def _finish_native(self, page, book: str, btemp: Path, page_no: int, total: int, info) -> None:
-        native = extract_native_text(page)
-        pbase = btemp / f"page-{page_no:04d}"
-        pbase.with_suffix(".final.md").write_text(native, encoding="utf-8")
-        self._write_meta(pbase, {"page": page_no, "kind": info.kind, "engine": "native",
-                                 "chars": len(native)})
-        self.state.set_page(book, page_no, "done", engine="native", extra={"kind": info.kind})
-        log.info("page %d/%d [%s] engine=native", page_no, total, info.kind)
-
-    def _finish_blank(self, book: str, btemp: Path, page_no: int, total: int, info) -> None:
-        pbase = btemp / f"page-{page_no:04d}"
-        pbase.with_suffix(".final.md").write_text("", encoding="utf-8")
-        self._write_meta(pbase, {"page": page_no, "kind": info.kind, "engine": "none", "chars": 0})
-        self.state.set_page(book, page_no, "done", engine="none", extra={"kind": info.kind})
-        log.info("page %d/%d [%s] engine=none (blank)", page_no, total, info.kind)
-
-    # ---- chunk building ------------------------------------------------
     def _serialize(self, doc, a: int, b: int) -> bytes:
         import fitz
 
@@ -165,7 +128,7 @@ class Pipeline:
 
     # ---- chunk processing ----------------------------------------------
     def _process_chunk(self, book: str, btemp: Path, ca: int, cb: int,
-                       payload: bytes, kind: str, total: int) -> None:
+                       payload: bytes, kind: str) -> None:
         chunk_key = f"p{ca + 1:04d}-{cb + 1:04d}"
         if self.state.chunk_attempts(book, chunk_key) >= self.chunk_retries:
             for p in range(ca + 1, cb + 2):
@@ -196,7 +159,7 @@ class Pipeline:
                     continue
                 pbase = btemp / f"page-{p:04d}"
                 pbase.with_suffix(".final.md").write_text(md_by_page[p], encoding="utf-8")
-                self._write_meta(pbase, {"page": p, "kind": "visual", "engine": f"oxr:{self.mode}",
+                self._write_meta(pbase, {"page": p, "engine": f"oxr:{self.mode}",
                                          "chunk": chunk_key, "chars": len(md_by_page[p])})
                 self.state.set_page(book, p, "done", engine=f"oxr:{self.mode}",
                                     extra={"chunk": chunk_key})
