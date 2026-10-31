@@ -86,6 +86,25 @@ class TestOxrBlocks(unittest.TestCase):
         self.assertIn("a", md)
         self.assertIn("[figure omitted]", md)
 
+    def test_caption_after_dropped_figure_is_dropped(self):
+        blocks = [{"type": "text", "content": "before"},
+                  {"type": "picture", "content": "http://x/fig.png"},
+                  {"type": "caption", "content": "Figure 1: A result"},
+                  {"type": "text", "content": "after"}]
+        md = blocks_to_markdown(blocks)
+        self.assertIn("before", md)
+        self.assertIn("after", md)
+        self.assertNotIn("Figure 1", md)
+
+    def test_caption_alone_is_kept(self):
+        self.assertIn("Table 1: B", blocks_to_markdown([{"type": "caption", "content": "Table 1: B"}]))
+
+    def test_pages_picture_counts(self):
+        from ocr_pipeline.ocr.oxr_blocks import pages_picture_counts
+        pages = [{"page_num": 0, "blocks": [{"type": "Picture"}, {"type": "Text"}]},
+                 {"page_num": 1, "blocks": [{"type": "Text"}]}]
+        self.assertEqual(pages_picture_counts(pages, page_base=0), {1: 1, 2: 0})
+
     def test_pages_to_markdown_offsets(self):
         pages = [{"page_num": 0, "blocks": [{"type": "text", "content": "one"}]},
                  {"page_num": 1, "blocks": [{"type": "text", "content": "two"}]}]
@@ -183,6 +202,132 @@ class TestStateThreadSafety(unittest.TestCase):
             self.assertEqual(store.counts("b.pdf").get("done"), 40)
             data = jsonlib.loads(path.read_text(encoding="utf-8"))  # file must be valid JSON
             self.assertEqual(len(data["books"]["b.pdf"]["pages"]), 40)
+
+
+class TestCuration(unittest.TestCase):
+    BASE = dict(
+        section_drop=["references", "bibliography", "index", "preface", "foreword",
+                      "acknowledgements", "table of contents", "contents"],
+        section_drop_prefix=["appendix", "acknowledg"],
+        page_drop=["copyright", "all rights reserved", "isbn", "published by", "doi:"],
+        drop_before_first_heading=True,
+        first_heading_max_page=60,
+        toc_min_lines=4,
+        toc_min_ratio=0.5,
+        front_matter_max_chars=2000,
+    )
+
+    @staticmethod
+    def _pg(no, md, pics=0):
+        return {"page_no": no, "md": md, "n_pictures": pics}
+
+    def test_heading_normalization_and_matching(self):
+        from ocr_pipeline.curation import _matches, _norm_heading
+        self.assertEqual(_norm_heading("12. References"), "references")
+        self.assertTrue(_matches("Appendix A: Data", set(), ["appendix"]))
+        self.assertTrue(_matches("Contents", {"contents"}, []))
+        # dominance guard: a body chapter about contents is NOT a ToC section
+        self.assertFalse(_matches("Contents of the atmosphere", {"contents"}, []))
+
+    def test_blank_and_figure_only(self):
+        from ocr_pipeline.curation import curate
+        v = curate([self._pg(1, ""), self._pg(2, "", pics=2)], **self.BASE)
+        self.assertEqual(v[0]["reason"], "blank")
+        self.assertEqual(v[1]["reason"], "figure-only")
+
+    def test_toc_page_detected_by_dot_leaders(self):
+        from ocr_pipeline.curation import curate
+        toc = "\n".join(f"Chapter {i} Title {'.' * 8} {i}" for i in range(1, 7))
+        v = curate([self._pg(1, toc)], **self.BASE)
+        self.assertEqual(v[0]["reason"], "toc-page")
+
+    def test_front_matter_page(self):
+        from ocr_pipeline.curation import curate
+        md = ("Smoke Test Book\n\nISBN 978-0-123456-78-9\nCopyright the author\n"
+              "All rights reserved\nPublished by Example Press")
+        v = curate([self._pg(1, md)], **self.BASE)
+        self.assertEqual(v[0]["reason"], "front-matter")
+
+    def test_section_ranges_drop_until_next_kept_heading(self):
+        from ocr_pipeline.curation import curate
+        pages = [
+            self._pg(1, "# Chapter 1\n\nBody text one."),
+            self._pg(2, "More body text."),
+            self._pg(3, "# Acknowledgements\n\nThanks to everyone."),
+            self._pg(4, "More thanks."),
+            self._pg(5, "# References\n\n[1] A. Author, 2020."),
+            self._pg(6, "[2] B. Author, 2021."),
+            self._pg(7, "# Chapter 2\n\nBody resumes."),
+        ]
+        v = curate(pages, **self.BASE)
+        got = {d["page_no"]: d["verdict"] for d in v}
+        self.assertEqual(got, {1: "keep", 2: "keep", 3: "drop", 4: "drop",
+                               5: "drop", 6: "drop", 7: "keep"})
+        self.assertTrue(v[2]["reason"].startswith("section:"))
+        self.assertEqual(v[6]["verdict"], "keep")
+
+    def test_title_page_with_heading_is_front_matter(self):
+        # regression: a title page carries a real heading (the book title) and must
+        # not become the front-matter boundary
+        from ocr_pipeline.curation import curate
+        pages = [
+            self._pg(1, "# Smoke Test Book\n\nISBN 978-0-123456-78-9\nCopyright (c) 2026\n"
+                        "All rights reserved. Published by Example Press.\nDOI 10.1234/x"),
+            self._pg(2, "# Chapter 1\n\nBody."),
+        ]
+        v = curate(pages, **self.BASE)
+        self.assertEqual(v[0]["verdict"], "drop")
+        self.assertEqual(v[0]["reason"], "front-matter")
+        self.assertEqual(v[1]["verdict"], "keep")
+
+    def test_drop_before_first_heading(self):
+        from ocr_pipeline.curation import curate
+        pages = [self._pg(1, "Dedication: for my mother."),
+                 self._pg(2, "# Chapter 1\n\nBody.")]
+        v = curate(pages, **self.BASE)
+        self.assertEqual(v[0]["reason"], "front-matter")
+        self.assertEqual(v[1]["verdict"], "keep")
+
+    def test_drop_before_first_heading_guard(self):
+        from ocr_pipeline.curation import curate
+        # no kept heading inside the window -> the rule must not fire
+        v = curate([self._pg(1, "Body text without any headings.")],
+                   **dict(self.BASE, first_heading_max_page=1))
+        self.assertEqual(v[0]["verdict"], "keep")
+
+
+class TestAssemble(unittest.TestCase):
+    def test_pure_join_no_headers_or_markers(self):
+        import tempfile
+        from ocr_pipeline.assemble import assemble_book
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "page-0002.final.md").write_text("two", encoding="utf-8")
+            (d / "page-0001.final.md").write_text("one", encoding="utf-8")
+            (d / "page-0003.oxr.md").write_text("dropped page never assembles", encoding="utf-8")
+            out = assemble_book(d, d / "book.md")
+            self.assertEqual(out.read_text(encoding="utf-8"), "one\n\ntwo\n")
+
+
+class TestLedger(unittest.TestCase):
+    def test_find_by_sha_and_failed_runs(self):
+        import tempfile
+
+        from ocr_pipeline.state import StateStore
+
+        with tempfile.TemporaryDirectory() as td:
+            s = StateStore(Path(td) / "books.json")
+            s.register_book("a.pdf", "SHA1", 3)
+            s.set_book_status("a.pdf", "done")
+            s.set_record_fields("a.pdf", {"doi": "10.1/x", "archived": True})
+            self.assertIsNotNone(s.find_by_sha("SHA1"))
+            self.assertIsNone(s.find_by_sha("SHA1", exclude_book="a.pdf"))
+            self.assertIsNone(s.find_by_sha("SHA2"))
+            self.assertEqual(s.bump_failed_runs("missing.pdf"), 0)
+            s.register_book("b.pdf", "SHA2", 3)
+            self.assertEqual(s.bump_failed_runs("b.pdf"), 1)
+            self.assertEqual(s.bump_failed_runs("b.pdf"), 2)
 
 
 if __name__ == "__main__":

@@ -51,12 +51,20 @@ def block_to_markdown(block: dict) -> str | None:
 
 def blocks_to_markdown(blocks, figure_marker: bool = False) -> str:
     parts: list[str] = []
+    prev_dropped_figure = False
     for block in blocks or []:
+        btype = _norm_type(block.get("type"))
         md = block_to_markdown(block)
         if md:
+            if btype == "caption" and prev_dropped_figure:
+                prev_dropped_figure = False
+                continue  # caption belongs to the dropped figure -> drop it too
             parts.append(md)
-        elif figure_marker and _norm_type(block.get("type")) in _FIGURES:
-            parts.append("*[figure omitted]*")
+            prev_dropped_figure = False
+        elif btype in _FIGURES:
+            prev_dropped_figure = True
+            if figure_marker:
+                parts.append("*[figure omitted]*")
     return "\n\n".join(parts).strip()
 
 
@@ -73,4 +81,17 @@ def pages_to_markdown(pages, page_base: int = 0) -> dict[int, str]:
         except (TypeError, ValueError):
             num = i
         out[page_base + num + 1] = blocks_to_markdown(page.get("blocks"))
+    return out
+
+
+def pages_picture_counts(pages, page_base: int = 0) -> dict[int, int]:
+    """Map OXR pages[] -> {absolute_page_no: number of figure/picture blocks}."""
+    out: dict[int, int] = {}
+    for i, page in enumerate(pages or []):
+        try:
+            num = int(page.get("page_num", i))
+        except (TypeError, ValueError):
+            num = i
+        out[page_base + num + 1] = sum(
+            1 for b in page.get("blocks") or [] if _norm_type(b.get("type")) in _FIGURES)
     return out

@@ -1,36 +1,18 @@
-"""Combine per-page refined markdown files into one book-level .md file."""
+"""Combine kept per-page markdown files into one PURE training file.
+
+The output is training data for a scientific LLM: body content only — no
+header block, no title line, no page markers, no separators. All provenance
+lives in the ledger and the sidecar record.
+"""
 from __future__ import annotations
 
-import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 
-def assemble_book(book_temp_dir: Path, out_path: Path, title: str, meta: dict,
-                  add_page_markers: bool = True, page_separator: str = "---") -> Path:
+def assemble_book(book_temp_dir: Path, out_path: Path) -> Path:
     pages = sorted(book_temp_dir.glob("page-*.final.md"))
-    sep = f"\n\n{page_separator}\n\n"
-    chunks: list[str] = []
-    for p in pages:
-        m = re.match(r"page-(\d+)\.final\.md$", p.name)
-        no = int(m.group(1)) if m else 0
-        body = p.read_text(encoding="utf-8").strip()
-        if not body:
-            continue
-        chunks.append(f"<!-- page {no} -->\n\n{body}" if add_page_markers else body)
-
-    counts = meta.get("counts", {})
-    header = "\n".join([
-        f"# {title}",
-        "",
-        f"- source PDF: `{meta.get('source', '')}`",
-        f"- sha256: `{meta.get('sha256', '')}`",
-        f"- pages processed: {len(pages)} (state: {counts})",
-        f"- generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
-        "- pipeline: advanced-ocr v3 (100% OXR-1.0 via the SoMark API)",
-        "",
-    ])
-    text = header + sep.join(chunks) + "\n"
+    chunks = [p.read_text(encoding="utf-8").strip() for p in pages]
+    text = "\n\n".join(c for c in chunks if c).strip() + "\n"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name(out_path.name + ".tmp")

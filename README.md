@@ -1,98 +1,94 @@
-# Advanced OCR (v3 — 100% OXR-1.0)
+# Advanced OCR (v0.6.0 — curated training-corpus builder)
 
-PDF books → clean, individual Markdown files. Runs on **Google Colab**, keeps **all code in this GitHub repo** and **all data in Google Drive**, and is fully **resumable** — stop anytime, rerun, continue where it left off. `raw/` is scanned **recursively**, so you can organize PDFs in any subfolder system; `refined/` mirrors that structure.
+Turn a bulk archive of PDF books into **clean per-book Markdown files for training a scientific LLM**. Runs on **Google Colab (CPU is enough)**, keeps **all code in this GitHub repo** and **all data in Google Drive**, and is fully **resumable** — stop anytime, rerun, continue where it left off.
 
-v3 uses **[SoMarkAI/OXR-1.0](https://github.com/SoMarkAI/OXR)**, a 1.3B document-parsing model, as the **only** engine: **every page of every PDF is parsed by OXR** (the native PDF text layer is not used at all), so the whole book gets uniform OXR structure — tables (Markdown), formulas (LaTeX `$$…$$`), chemical equations (mhchem), chemical structures (SMILES), code blocks, titles and reading order. **No API keys are needed at all.**
+Every page of every PDF is parsed by **[SoMarkAI/OXR-1.0](https://github.com/SoMarkAI/OXR)** (tables → Markdown, formulas → LaTeX, chemical equations → mhchem, structures → SMILES, code → fences). A deterministic **curation pass** then keeps only body content, each book assembles into **one pure-content `.md` file**, and a **permanent ledger** records exactly what was done. **No API keys anywhere.**
 
 ## Architecture
 
 ```
-raw PDF (Drive: OCR Engine/raw/*.pdf)
-   │  100% of pages go to OXR (page-level resume in books.json)
+raw/<any subfolders>/*.pdf
+   │  intake gate: sha256 checked against the ledger — duplicates skipped & archived
    ▼
-pending pages → contiguous chunks (≤20 pages AND ≤9 MiB per chunk;
-                an oversized single page → rendered 200dpi PNG)
-   → POST {oxr}/parse/sync (output_formats=json)
-   → OXR JSON blocks → per-page Markdown (temp/<book>/page-XXXX.final.md)
-   → refined/<book>.md   (one combined Markdown per book)
+100% of pages → chunks (≤20 pages, ≤9 MiB; oversized page → rendered PNG)
+   → POST {oxr}/parse/sync (output_formats=json), up to max_concurrent in flight
+   → OXR JSON blocks → per-page Markdown (temp/<book>/page-XXXX.oxr.md)
+   ▼
+curation pass (deterministic, config-editable)
+   DROP: title/copyright/dedication pages · printed ToC pages · acknowledgements ·
+         preface/foreword · references/bibliography · index · appendices ·
+         blank pages · figure-only pages · captions of dropped figures
+   KEEP: body chapters only
+   ▼
+refined/<same relative path>/<book>.md   ← PURE content: no header, no markers
+<book>.record.json (sidecar)             ← provenance next to every file
+books.json (permanent ledger)            ← sha256, DOI, ISBN, drop breakdown
+   ▼  lifecycle (only when 100% of pages are converted or dropped)
+temp/<book>/ pruned · source PDF → raw/_done/<same relative path>
+(books failing 5 runs → raw/_failed/)
 ```
 
-**OXR element handling** (per page, from the `json` output):
+## Curation
 
-| OXR element | Goes into the Markdown as |
-| --- | --- |
-| Title | `#`-heading (uses OXR's `title_level`) |
-| Text / Caption / Footnote / Stamp | plain paragraph |
-| Table | Markdown table (element_formats `table=markdown`) |
-| Formula | `$$…$$` LaTeX |
-| Chemical Equation | `$$\ce{…}$$` mhchem LaTeX |
-| Chemical Structure | SMILES inline code |
-| Code Block | fenced code block |
-| Picture | dropped (OXR's API has no image understanding; non-textifiable images are ignored) — or `*[figure omitted]*` marker with `output.figure_marker: true` |
-| Page header/footer | dropped (`keep_header_footer: false`) |
+The refined file is **training data, not a readable book** — anything that is not body content is dropped silently and completely:
 
-> Note: unlike the v1 Gemini-refiner path, flowcharts/diagrams that are pure graphics cannot be converted to text any more — OXR's API does not support image understanding. Everything with textual content (tables, formulas, chemistry, code) is captured as text.
+- **Section ranges**: a top-level heading matching a drop pattern ("References", "Appendix A", "Preface", …) drops everything until the next kept top-level heading — dense bibliography pages would never survive a per-page check.
+- **Page rules**: dot-leader ToC pages, front-matter boilerplate (copyright/ISBN/publisher), blank pages, figure-only pages (figures themselves are always omitted — OXR's API does no image understanding).
+- **Front-matter boundary**: pages before the book's first kept heading are dropped (guarded — the rule only fires when such a heading actually exists early enough).
+- Everything is **config-editable** (`curation.*` in the Drive config) and **auditable**: each page's verdict lands in its `meta.json` and the ledger's drop breakdown (reason → page numbers). `reset <book>` re-does a book if a rule ever misfires.
 
-## OXR modes (`oxr.mode` in the Drive config)
+## Ledger & lifecycle
 
-> **Runtime note: a CPU-only Colab runtime is enough.** In `free_api` mode the OXR model runs on
-> SoMark's servers — your runtime only slices PDFs and makes HTTP calls, so GPU VRAM stays at zero.
-> A GPU is used **only** in `oxr.mode=local` (self-hosted), which needs a ≥24GB BF16 NVIDIA GPU.
-
-- **`free_api`** (default): `https://free-oxr.somark.ai/api/v1` — **no key, no sign-up**. Limits per request: 10 MB / 20 pages (our chunker respects both; single oversized pages are sent as rendered PNGs), requests are queued and best-effort. Works on any Colab runtime, CPU included.
-- **`local`** (self-hosted OXR): point `base_url` (or `oxr.local_base_url`) at your own OXR service, e.g. `http://127.0.0.1:8000/v1` — same SoMark-compatible `/parse/sync` contract, no limits. Requirements per the [OXR repo](https://github.com/SoMarkAI/OXR): Linux, **NVIDIA GPU ≥24 GB with BF16** (a free Colab T4 does NOT qualify; Colab Pro A100/L4-class does), CUDA 13.0 driver, Python 3.12. Deployment: Docker all-in-one, or the three-service source setup (vLLM + out-of-tree plugin on :8080, layout model on :8081, `oxr serve` on :8000).
-- `oxr.base_url` overrides whichever mode default; `oxr.api_key` stays `dummy` unless you aim it at SoMark production.
+- **`config/books.json` is a permanent ledger**: for every processed book it keeps sha256, extracted **DOI** and **ISBN** (regex-parsed from the pages — front-matter pages are parsed before being dropped), detected title, pages kept/dropped with reasons, output path, timestamps. Done entries are never pruned (except by an explicit `reset`).
+- **Sidecar**: `refined/<…>/<book>.record.json` mirrors the record next to each output file, so dataset assembly doesn't need to parse the ledger.
+- **Intake gate**: a PDF whose sha256 already exists in the ledger (as done or failed) is skipped automatically and its file archived — re-uploaded duplicates never cost API calls.
+- **Lifecycle**: when 100% of a book's pages are converted *or* dropped → `temp/<book>/` is pruned and the source PDF moves to `raw/_done/<same relative path>`. Books that end incomplete on `lifecycle.failed_run_limit` (default 5) runs are quarantined to `raw/_failed/`. Partial books simply stay in `raw/` and resume.
 
 ## Drive layout
 
 ```
 OCR Engine/
-  raw/       raw PDF files — scanned recursively, so any subfolder system works:
-             raw/mybook.pdf, raw/math/algebra/book.pdf, ...
+  raw/           intake queue, scanned recursively (any subfolder system)
+    _done/       archived source PDFs of completed books (mirrors raw/ structure)
+    _failed/     quarantined sources of books that kept failing
   config/
-    pipeline.json   runtime settings (written by `init-config`, then editable in Drive)
-    books.json      resume manifest — do not edit by hand
-  refined/     final output, mirroring the raw/ structure:
-               raw/math/algebra/book.pdf -> refined/math/algebra/book.md
-  temp/        per-book working files, mirrored too (temp/math/algebra/book/):
-    page-0001.final.md      final per-page Markdown (OXR JSON blocks -> Markdown)
-    p0001-0020.oxr.json     OXR JSON output (per-chunk source of truth)
-    p0001-0020.oxr.md       OXR markdown output (debug reference)
-    page-0001.meta.json     decision trail (engine, chunk, chars)
+    pipeline.json   settings (written by `init-config`, editable in Drive)
+    books.json      permanent ledger — do not edit by hand
+  refined/        output, mirroring raw/: book.md + book.record.json per source
+  temp/<book>/    working files, pruned automatically on completion:
+    p0001-0020.oxr.json/.oxr.md   OXR chunk outputs (debug)
+    page-XXXX.oxr.md              parsed page (pre-curation)
+    page-XXXX.final.md            kept page (post-curation)
+    page-XXXX.meta.json           engine, chunk, verdict, drop reason
 ```
-
-A book's identity is its path relative to `raw/` (e.g. `math/algebra/book.pdf`), so same-named PDFs in different subfolders never collide.
 
 ## Usage on Colab
 
-Open `notebooks/colab_runner.ipynb` from this repo in Colab and run the cells top to bottom: install deps → mount Drive → sync repo (`git pull`, so pushing updates to GitHub is enough — never re-upload the notebook) → `doctor` → `run`. Drop PDFs into **Drive → `OCR Engine/raw/`** first.
-
-The notebook cells call the CLI:
+Open `notebooks/colab_runner.ipynb` from this repo in Colab (**CPU runtime is enough** — the OXR model runs on SoMark's servers) and run the cells top to bottom: install deps → mount Drive → sync repo (`git pull`, so pushing updates to GitHub is enough) → `doctor` → `run`. Drop PDFs into **any subfolder of `Drive/OCR Engine/raw/`**.
 
 ```bash
-python -m ocr_pipeline doctor        --drive-root "/content/drive/MyDrive/OCR Engine"
-python -m ocr_pipeline init-config   --drive-root ...   # once: write default settings to Drive
-python -m ocr_pipeline status        --drive-root ...   # show resume state
-python -m ocr_pipeline run           --drive-root ...   # process all pending PDFs in raw/ (resumable, recursive)
+python -m ocr_pipeline doctor      --drive-root "/content/drive/MyDrive/OCR Engine"
+python -m ocr_pipeline init-config --drive-root ...   # once: write default settings to Drive
+python -m ocr_pipeline status      --drive-root ...   # ledger summary (kept/dropped/DOI per book)
+python -m ocr_pipeline run         --drive-root ...   # process all pending PDFs (resumable)
 python -m ocr_pipeline run-book math/algebra/book.pdf --drive-root ...   # path relative to raw/
-python -m ocr_pipeline reset math/algebra/book.pdf    --drive-root ...   # forget state + temp, reprocess
+python -m ocr_pipeline reset math/algebra/book.pdf    --drive-root ...   # forget state+ledger entry, reprocess
 ```
 
-- **Resume**: state lives in `OCR Engine/config/books.json`. A page is only marked `done` after its final markdown is on disk, so rerunning redoes only the unfinished pages. Failed OXR chunks are retried on the next run (up to `chunking.chunk_retries`, then the pages are marked `error`). If a PDF changes on disk (sha256 mismatch), its page states reset.
-- **Upgrading from v1/v2**: books processed by earlier versions keep their old states (v2 pages extracted natively stay native). To re-convert a book 100% with OXR, run `reset <book>` and rerun.
+Note on `reset`: it clears the book's ledger entry and temp dir. If the source was already archived to `raw/_done/`, move it back into `raw/` first.
+
+## OXR modes (`oxr.mode`)
+
+> **Runtime note: a CPU-only Colab runtime is enough.** In `free_api` mode the OXR model runs on SoMark's servers — your runtime only slices PDFs and makes HTTP calls. A GPU is used **only** in `oxr.mode=local` (self-hosted, ≥24GB BF16 NVIDIA GPU, Colab Pro L4/A100-class).
+
+- **`free_api`** (default): `https://free-oxr.somark.ai/api/v1` — no key, no sign-up. Limits: 10MB / 20 pages per request (the chunker respects both), queued and best-effort. *Contingency:* the free API is explicitly not-for-production; if it ever degrades, the paths are (a) self-hosted OXR per the OXR repo, or (b) a paid SoMark key — the client already speaks that API, only `oxr.base_url`/`api_key` change.
+- **`local`**: point `oxr.local_base_url` at your own OXR service (`http://127.0.0.1:8000/v1`), no limits.
 
 ## Config reference
 
-See `config/pipeline.example.json` (same content as what `init-config` writes to Drive). Notable knobs:
+See `config/pipeline.example.json` (= what `init-config` writes to Drive). Groups: `oxr.*` (mode/URL/formats/sampling), `chunking.*` (max_pages, max_bytes, max_concurrent, render_dpi, chunk_retries), `curation.*` (enabled, section_drop, section_drop_prefix, page_drop, front-matter boundary + ToC thresholds), `lifecycle.*` (prune_temp, done_folder, failed_folder, delete_source, failed_run_limit), `output.figure_marker`.
 
-- `oxr.mode`, `oxr.base_url` — free API vs self-hosted (see above)
-- `oxr.element_formats` — `image: none|base64|url`, `formula: latex`, `table: markdown|html`, `cs: smiles|image`
-- `oxr.extra` — OXR-only sampling: `temperature` / `top_p` / `repetition_penalty`
-- `chunking.max_pages` (free-API ceiling 20), `chunking.max_bytes` (ceiling 10 MB), `chunking.render_dpi`, `chunking.chunk_retries`
-- `chunking.max_concurrent` — parallel chunk uploads (default 2). Each request is independent and resume is page-level, so raising it to 3–4 can cut wall time further — but the free API is queued and best-effort, so raise it gently and back off if you see 429s.
-- `output.figure_marker` — emit `*[figure omitted]*` where a picture was dropped
-
-## Local development
+## Development
 
 ```bash
 pip install -r requirements.txt

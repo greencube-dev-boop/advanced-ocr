@@ -57,7 +57,9 @@ def main(argv=None) -> int:
             print("no books registered yet")
         for name, entry in state.data["books"].items():
             print(f"{name}: status={entry.get('status')} pages_total={entry.get('pages_total')} "
-                  f"counts={state.counts(name)} output={entry.get('output')}")
+                  f"counts={state.counts(name)} kept={entry.get('pages_kept')} "
+                  f"dropped={entry.get('pages_dropped')} doi={entry.get('doi') or '-'} "
+                  f"failed_runs={entry.get('failed_runs', 0)} output={entry.get('output')}")
         return 0
 
     if args.command == "reset":
@@ -105,6 +107,13 @@ def _doctor(layout, cfg) -> int:
     print(f"chunking   : max_pages={cfg.get('chunking', 'max_pages', default=20)} "
           f"max_bytes={cfg.get('chunking', 'max_bytes', default=9437184)} "
           f"max_concurrent={cfg.get('chunking', 'max_concurrent', default=2)}")
+    print(f"curation   : enabled={cfg.get('curation', 'enabled', default=True)} "
+          f"(front matter / ToC / acknowledgements / references / index / appendices / "
+          f"blank / figure-only pages are dropped)")
+    print(f"lifecycle  : prune_temp={cfg.get('lifecycle', 'prune_temp', default=True)} "
+          f"done_folder=raw/{cfg.get('lifecycle', 'done_folder', default='_done')} "
+          f"failed_folder=raw/{cfg.get('lifecycle', 'failed_folder', default='_failed')} "
+          f"failed_run_limit={cfg.get('lifecycle', 'failed_run_limit', default=5)}")
     try:
         r = requests.get(base, timeout=10)
         print(f"oxr reach  : HTTP {r.status_code} (reachable)")

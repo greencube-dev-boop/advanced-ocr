@@ -134,6 +134,38 @@ class StateStore:
     def chunk_attempts(self, book: str, key: str) -> int:
         return int(self.book(book).get("chunks", {}).get(key, {}).get("attempts", 0))
 
+    # ---- ledger ---------------------------------------------------------
+    def find_by_sha(self, sha256: str, exclude_book: str | None = None) -> dict | None:
+        """First completed/failed record with this sha256 (duplicate pre-flight)."""
+        with self._lock:
+            for name, entry in self.data["books"].items():
+                if name == exclude_book:
+                    continue
+                if entry.get("sha256") == sha256 and entry.get("status") in ("done", "failed"):
+                    return {"book": name, "status": entry.get("status"),
+                            "doi": entry.get("doi"), "output": entry.get("output")}
+        return None
+
+    def bump_failed_runs(self, book: str) -> int:
+        with self._lock:
+            entry = self.data["books"].get(book)
+            if entry is None:
+                return 0
+            entry["failed_runs"] = entry.get("failed_runs", 0) + 1
+            entry["updated_at"] = _now()
+            self.save()
+            return entry["failed_runs"]
+
+    def set_record_fields(self, book: str, fields: dict) -> None:
+        """Attach ledger fields (doi, isbn, title, kept/dropped breakdown, ...)."""
+        with self._lock:
+            entry = self.data["books"].get(book)
+            if entry is None:
+                return
+            entry.update(fields)
+            entry["updated_at"] = _now()
+            self.save()
+
     # ---- reset ---------------------------------------------------------
     def forget(self, book: str) -> None:
         """Drop a book's whole state (used by `ocr_pipeline reset`)."""
