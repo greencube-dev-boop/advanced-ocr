@@ -35,6 +35,10 @@ pending pages → contiguous chunks (≤20 pages AND ≤9 MiB per chunk;
 
 ## OXR modes (`oxr.mode` in the Drive config)
 
+> **Runtime note: a CPU-only Colab runtime is enough.** In `free_api` mode the OXR model runs on
+> SoMark's servers — your runtime only slices PDFs and makes HTTP calls, so GPU VRAM stays at zero.
+> A GPU is used **only** in `oxr.mode=local` (self-hosted), which needs a ≥24GB BF16 NVIDIA GPU.
+
 - **`free_api`** (default): `https://free-oxr.somark.ai/api/v1` — **no key, no sign-up**. Limits per request: 10 MB / 20 pages (our chunker respects both; single oversized pages are sent as rendered PNGs), requests are queued and best-effort. Works on any Colab runtime, CPU included.
 - **`local`** (self-hosted OXR): point `base_url` (or `oxr.local_base_url`) at your own OXR service, e.g. `http://127.0.0.1:8000/v1` — same SoMark-compatible `/parse/sync` contract, no limits. Requirements per the [OXR repo](https://github.com/SoMarkAI/OXR): Linux, **NVIDIA GPU ≥24 GB with BF16** (a free Colab T4 does NOT qualify; Colab Pro A100/L4-class does), CUDA 13.0 driver, Python 3.12. Deployment: Docker all-in-one, or the three-service source setup (vLLM + out-of-tree plugin on :8080, layout model on :8081, `oxr serve` on :8000).
 - `oxr.base_url` overrides whichever mode default; `oxr.api_key` stays `dummy` unless you aim it at SoMark production.
