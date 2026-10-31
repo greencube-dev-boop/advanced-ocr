@@ -103,7 +103,8 @@ def _doctor(layout, cfg) -> int:
     print(f"oxr mode   : {mode}")
     print(f"oxr base   : {base}")
     print(f"chunking   : max_pages={cfg.get('chunking', 'max_pages', default=20)} "
-          f"max_bytes={cfg.get('chunking', 'max_bytes', default=9437184)}")
+          f"max_bytes={cfg.get('chunking', 'max_bytes', default=9437184)} "
+          f"max_concurrent={cfg.get('chunking', 'max_concurrent', default=2)}")
     try:
         r = requests.get(base, timeout=10)
         print(f"oxr reach  : HTTP {r.status_code} (reachable)")

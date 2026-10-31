@@ -11,4 +11,4 @@ The Colab notebook is only a runner; all code lives in this repo and all data
 lives in Google Drive under "OCR Engine/".
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -20,6 +20,8 @@ Response: {"code": 0|error_code, "message", "warnings", "data": {"result": {"out
 from __future__ import annotations
 
 import json
+import random
+import threading
 import time
 
 import requests
@@ -48,7 +50,17 @@ class OxrClient:
         self.element_formats = element_formats
         self.feature_config = feature_config
         self.extra = extra
-        self.session = session or requests.Session()
+        self._shared_session = session
+        self._local = threading.local()  # requests.Session is not guaranteed thread-safe
+
+    @property
+    def session(self) -> requests.Session:
+        if self._shared_session is not None:
+            return self._shared_session
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = self._local.session = requests.Session()
+        return s
 
     def parse(self, file_bytes: bytes, filename: str = "document.pdf",
               mime: str = "application/pdf") -> dict:
@@ -85,5 +97,7 @@ class OxrClient:
             except requests.RequestException as e:
                 last = str(e)
             if attempt < self.max_retries:
-                time.sleep(self.backoff * attempt)
+                # jittered exponential backoff — with parallel workers this also
+                # staggers retries so they don't hammer the server in lockstep
+                time.sleep(self.backoff * attempt + random.uniform(0.0, 2.0))
         raise OxrError(f"parse/sync failed after {self.max_retries} attempts: {last}")

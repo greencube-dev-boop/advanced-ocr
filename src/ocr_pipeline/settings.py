@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 DEFAULTS: dict = {
-    "version": 3,
+    "version": 4,
     "oxr": {
         "mode": "free_api",      # free_api (no key, 10MB/20-pages per request) | local (self-hosted)
         "base_url": "",          # explicit override; empty -> per-mode default below
@@ -31,6 +31,7 @@ DEFAULTS: dict = {
     "chunking": {
         "max_pages": 20,         # free-API ceiling per request
         "max_bytes": 9437184,    # 9 MiB, under the 10MB free-API ceiling
+        "max_concurrent": 2,     # parallel chunk uploads (raise with care: free API is best-effort)
         "render_dpi": 200,       # fallback rendering when a single page exceeds max_bytes
         "chunk_retries": 3,      # failed chunks are retried on the next run, up to this
     },

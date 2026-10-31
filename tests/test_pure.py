@@ -29,6 +29,9 @@ class TestCfg(unittest.TestCase):
         for gone in ("tesseract", "nemotron", "suspicion", "refiner", "page"):
             self.assertNotIn(gone, DEFAULTS)
 
+    def test_parallel_upload_defaults_are_polite(self):
+        self.assertEqual(DEFAULTS["chunking"]["max_concurrent"], 2)
+
     def test_default_mode_is_free_api(self):
         self.assertEqual(DEFAULTS["oxr"]["mode"], "free_api")
         self.assertEqual(DEFAULTS["oxr"]["element_formats"]["table"], "markdown")
@@ -152,6 +155,34 @@ class TestChunking(unittest.TestCase):
     def test_split_range_oversized_single_page_kept(self):
         measure = lambda rng: 10 ** 9
         self.assertEqual(split_range(5, 5, measure, 100), [(5, 5)])
+
+
+class TestStateThreadSafety(unittest.TestCase):
+    def test_concurrent_set_page_keeps_manifest_valid(self):
+        import json as jsonlib
+        import tempfile
+        import threading
+
+        from ocr_pipeline.state import StateStore
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "books.json"
+            store = StateStore(path)
+            store.register_book("b.pdf", "sha", 40)
+
+            def worker(i: int) -> None:
+                for p in range(i * 5 + 1, i * 5 + 6):  # 5 distinct pages per worker
+                    store.set_page("b.pdf", p, "done", engine="oxr:free_api")
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(store.counts("b.pdf").get("done"), 40)
+            data = jsonlib.loads(path.read_text(encoding="utf-8"))  # file must be valid JSON
+            self.assertEqual(len(data["books"]["b.pdf"]["pages"]), 40)
 
 
 if __name__ == "__main__":

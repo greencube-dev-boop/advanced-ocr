@@ -25,6 +25,7 @@
   "chunking": {
     "max_pages": 20,
     "max_bytes": 9437184,
+    "max_concurrent": 2,
     "render_dpi": 200,
     "chunk_retries": 3
   },

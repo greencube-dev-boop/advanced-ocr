@@ -89,6 +89,7 @@ See `config/pipeline.example.json` (same content as what `init-config` writes to
 - `oxr.element_formats` — `image: none|base64|url`, `formula: latex`, `table: markdown|html`, `cs: smiles|image`
 - `oxr.extra` — OXR-only sampling: `temperature` / `top_p` / `repetition_penalty`
 - `chunking.max_pages` (free-API ceiling 20), `chunking.max_bytes` (ceiling 10 MB), `chunking.render_dpi`, `chunking.chunk_retries`
+- `chunking.max_concurrent` — parallel chunk uploads (default 2). Each request is independent and resume is page-level, so raising it to 3–4 can cut wall time further — but the free API is queued and best-effort, so raise it gently and back off if you see 429s.
 - `output.figure_marker` — emit `*[figure omitted]*` where a picture was dropped
 
 ## Local development

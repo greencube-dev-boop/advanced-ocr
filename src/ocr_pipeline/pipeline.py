@@ -7,7 +7,8 @@ LaTeX formulas, mhchem, SMILES, code fences).
 Per book:
   1. all not-yet-done pages are grouped into contiguous chunks
      (<=20 pages AND <=9MiB per chunk; an oversized single page is rendered
-     to PNG) -> POST {oxr}/parse/sync -> OXR JSON blocks -> per-page markdown
+     to PNG) -> POST {oxr}/parse/sync -> OXR JSON blocks -> per-page markdown;
+     up to `chunking.max_concurrent` chunks upload in parallel
   2. every finished page lands in temp/<book>/page-XXXX.final.md and books.json
   3. assemble refined/<book>.md
 """
@@ -51,6 +52,7 @@ class Pipeline:
         c = cfg.section("chunking")
         self.max_pages = int(c.get("max_pages", default=20))
         self.max_bytes = int(c.get("max_bytes", default=9437184))
+        self.max_concurrent = max(1, int(c.get("max_concurrent", default=2)))
         self.render_dpi = int(c.get("render_dpi", default=200))
         self.chunk_retries = int(c.get("chunk_retries", default=3))
         self.figure_marker = bool(cfg.get("output", "figure_marker", default=False))
@@ -84,9 +86,12 @@ class Pipeline:
         # every not-yet-done page goes through OXR — no native-text fast path
         pending = [p for p in range(1, total + 1)
                    if self.state.page(book_key, p).get("status") != "done"]
-        for a0, b0 in _contiguous(pending):        # inclusive 0-based
-            for ca, cb, payload, kind in self._build_chunks(doc, a0, b0):
-                self._process_chunk(book_key, btemp, ca, cb, payload, kind)
+        if self.max_concurrent == 1:
+            for a0, b0 in _contiguous(pending):        # inclusive 0-based
+                for ca, cb, payload, kind in self._build_chunks(doc, a0, b0):
+                    self._process_chunk(book_key, btemp, ca, cb, payload, kind)
+        else:
+            self._run_chunks_parallel(doc, book_key, btemp, pending, workers=self.max_concurrent)
 
         doc.close()
         counts = self.state.counts(book_key)
@@ -116,6 +121,47 @@ class Pipeline:
         for ca, cb in paginate_range(a, b, self.max_pages):
             for piece in self._size_split(doc, ca, cb):
                 yield piece
+
+    def _chunk_generator(self, doc, pending: list[int]):
+        for a0, b0 in _contiguous(pending):
+            yield from self._build_chunks(doc, a0, b0)
+
+    def _run_chunks_parallel(self, doc, book_key: str, btemp: Path,
+                             pending: list[int], workers: int) -> None:
+        """Upload up to `workers` chunks concurrently.
+
+        Chunk payloads are produced lazily in the MAIN thread (fitz documents are
+        not thread-safe) and only the HTTP work runs in the worker pool. At most
+        workers*2 chunks are held in memory at once.
+        """
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        def drain(in_flight: dict) -> None:
+            done = wait(list(in_flight), return_when=FIRST_COMPLETED).done
+            for fut in done:
+                in_flight.pop(fut, None)
+                try:
+                    fut.result()
+                except Exception:
+                    log.exception("chunk worker crashed unexpectedly")
+
+        gen = self._chunk_generator(doc, pending)
+        log.info("uploading chunks with up to %d parallel requests", workers)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            in_flight: dict = {}
+            more = True
+            while more or in_flight:
+                while more and len(in_flight) < workers * 2:
+                    try:
+                        ca, cb, payload, kind = next(gen)
+                    except StopIteration:
+                        more = False
+                        break
+                    fut = pool.submit(self._process_chunk, book_key, btemp, ca, cb, payload, kind)
+                    in_flight[fut] = (ca, cb)
+                if not in_flight:
+                    break
+                drain(in_flight)
 
     def _size_split(self, doc, a: int, b: int):
         data = self._serialize(doc, a, b)

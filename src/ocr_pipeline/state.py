@@ -4,10 +4,15 @@ Everything needed to restart the project mid-book lives here:
 per-book sha256 + page count, and per-page status/engines/attempts/errors.
 A page only becomes "done" after its refined markdown is on disk, so a
 crashed run simply redoes the pages that are not done yet.
+
+All mutating methods take a reentrant lock, so parallel chunk workers can
+update page state without corrupting books.json (writes go through a temp
+file + atomic replace).
 """
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +24,7 @@ def _now() -> str:
 class StateStore:
     def __init__(self, path):
         self.path = Path(path)
+        self._lock = threading.RLock()
         self.data: dict = {"version": 1, "books": {}}
         if self.path.exists():
             try:
@@ -30,13 +36,18 @@ class StateStore:
         self.data.setdefault("books", {})
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.path)  # atomic: a kill mid-write never corrupts books.json
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)  # atomic: a kill mid-write never corrupts books.json
 
     # ---- books -------------------------------------------------------
     def register_book(self, name: str, sha256: str, num_pages: int) -> dict:
+        with self._lock:
+            return self._register_book(name, sha256, num_pages)
+
+    def _register_book(self, name: str, sha256: str, num_pages: int) -> dict:
         books = self.data["books"]
         entry = books.get(name)
         if entry is None:
@@ -66,14 +77,15 @@ class StateStore:
         return self.data["books"].get(name, {})
 
     def set_book_status(self, name: str, status: str, output: str | None = None) -> None:
-        entry = self.data["books"].get(name)
-        if entry is None:
-            return
-        entry["status"] = status
-        if output is not None:
-            entry["output"] = output
-        entry["updated_at"] = _now()
-        self.save()
+        with self._lock:
+            entry = self.data["books"].get(name)
+            if entry is None:
+                return
+            entry["status"] = status
+            if output is not None:
+                entry["output"] = output
+            entry["updated_at"] = _now()
+            self.save()
 
     # ---- pages -------------------------------------------------------
     def page(self, book: str, page_no: int) -> dict:
@@ -81,21 +93,22 @@ class StateStore:
 
     def set_page(self, book: str, page_no: int, status: str, engine: str | None = None,
                  error: str | None = None, extra: dict | None = None) -> None:
-        entry = self.data["books"].get(book)
-        if entry is None:
-            return
-        p = entry.setdefault("pages", {}).setdefault(str(page_no), {})
-        p["status"] = status
-        p["attempts"] = p.get("attempts", 0) + 1
-        p["updated_at"] = _now()
-        if engine is not None:
-            p["engine"] = engine
-        if error is not None:
-            p["error"] = error
-        if extra:
-            p.update(extra)
-        entry["updated_at"] = _now()
-        self.save()
+        with self._lock:
+            entry = self.data["books"].get(book)
+            if entry is None:
+                return
+            p = entry.setdefault("pages", {}).setdefault(str(page_no), {})
+            p["status"] = status
+            p["attempts"] = p.get("attempts", 0) + 1
+            p["updated_at"] = _now()
+            if engine is not None:
+                p["engine"] = engine
+            if error is not None:
+                p["error"] = error
+            if extra:
+                p.update(extra)
+            entry["updated_at"] = _now()
+            self.save()
 
     def counts(self, book: str) -> dict:
         tally: dict[str, int] = {}
@@ -106,16 +119,17 @@ class StateStore:
 
     # ---- OXR chunks (one /parse/sync request covering a page range) ----
     def record_chunk(self, book: str, key: str, error: str | None = None) -> None:
-        entry = self.data["books"].get(book)
-        if entry is None:
-            return
-        c = entry.setdefault("chunks", {}).setdefault(key, {"attempts": 0, "last_error": None})
-        c["attempts"] = c.get("attempts", 0) + 1
-        c["last_error"] = error
-        c["updated_at"] = _now()
-        c["ok"] = error is None
-        entry["updated_at"] = _now()
-        self.save()
+        with self._lock:
+            entry = self.data["books"].get(book)
+            if entry is None:
+                return
+            c = entry.setdefault("chunks", {}).setdefault(key, {"attempts": 0, "last_error": None})
+            c["attempts"] = c.get("attempts", 0) + 1
+            c["last_error"] = error
+            c["updated_at"] = _now()
+            c["ok"] = error is None
+            entry["updated_at"] = _now()
+            self.save()
 
     def chunk_attempts(self, book: str, key: str) -> int:
         return int(self.book(book).get("chunks", {}).get(key, {}).get("attempts", 0))
@@ -123,5 +137,6 @@ class StateStore:
     # ---- reset ---------------------------------------------------------
     def forget(self, book: str) -> None:
         """Drop a book's whole state (used by `ocr_pipeline reset`)."""
-        self.data["books"].pop(book, None)
-        self.save()
+        with self._lock:
+            self.data["books"].pop(book, None)
+            self.save()
