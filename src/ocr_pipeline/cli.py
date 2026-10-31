@@ -24,11 +24,12 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("run", help="Process all pending PDFs in raw/ (resumable)", parents=[common])
     p_book = sub.add_parser("run-book", help="Process a single PDF from raw/", parents=[common])
-    p_book.add_argument("name", help="file name, e.g. mybook.pdf")
+    p_book.add_argument("name",
+                        help="path relative to raw/, e.g. mybook.pdf or math/algebra/book.pdf")
     sub.add_parser("status", help="Show the resume state (books.json)", parents=[common])
     p_reset = sub.add_parser("reset", help="Forget a book's state and temp files (reprocess)",
                              parents=[common])
-    p_reset.add_argument("name", help="file name, e.g. mybook.pdf")
+    p_reset.add_argument("name", help="path relative to raw/, e.g. math/algebra/book.pdf")
     sub.add_parser("doctor", help="Check environment: deps, drive, OXR reachability",
                    parents=[common])
     sub.add_parser("init-config", help="Write the default pipeline.json into Drive config/",
@@ -60,10 +61,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "reset":
-        stem = Path(args.name).stem
-        shutil.rmtree(layout.book_temp(stem), ignore_errors=True)
-        state.forget(args.name)
-        print(f"reset: {args.name} (temp cleared, state forgotten)")
+        rel = Path(args.name)
+        shutil.rmtree(layout.book_temp(rel.with_suffix("").as_posix()), ignore_errors=True)
+        state.forget(rel.as_posix())
+        print(f"reset: {rel.as_posix()} (temp cleared, state forgotten)")
         return 0
 
     if args.command == "doctor":
@@ -75,7 +76,8 @@ def main(argv=None) -> int:
     elif args.command == "run-book":
         pdf = layout.raw / args.name
         if not pdf.exists():
-            log.error("not found in raw/: %s", pdf)
+            log.error("not found under raw/: %s (use the path relative to raw/, "
+                      "see `doctor` for the discovered PDFs)", pdf)
             return 2
         pipe.run_book(pdf)
     return 0

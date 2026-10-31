@@ -66,36 +66,39 @@ class Pipeline:
     def run_book(self, pdf_path) -> dict:
         import fitz  # PyMuPDF — imported lazily so pure modules stay testable
 
-        name = pdf_path.name
-        stem = pdf_path.stem
+        # folder-aware identity: "sub/dir/book.pdf" — same-named PDFs in
+        # different raw/ subfolders never collide
+        book_key = self.layout.rel_id(pdf_path)
+        rel_stem = self.layout.rel_stem(pdf_path)
+        title = self.layout.display_name(pdf_path)
         sha = hashing.sha256_file(pdf_path)
         doc = fitz.open(str(pdf_path))
         total = doc.page_count
-        self.state.register_book(name, sha, total)
-        log.info("Book %s: %d pages, sha=%s..., resume state %s", name, total, sha[:12],
-                 self.state.counts(name))
+        self.state.register_book(book_key, sha, total)
+        log.info("Book %s: %d pages, sha=%s..., resume state %s", book_key, total, sha[:12],
+                 self.state.counts(book_key))
 
-        btemp = self.layout.book_temp(stem)
+        btemp = self.layout.book_temp(rel_stem)
         btemp.mkdir(parents=True, exist_ok=True)
 
         # every not-yet-done page goes through OXR — no native-text fast path
         pending = [p for p in range(1, total + 1)
-                   if self.state.page(name, p).get("status") != "done"]
+                   if self.state.page(book_key, p).get("status") != "done"]
         for a0, b0 in _contiguous(pending):        # inclusive 0-based
             for ca, cb, payload, kind in self._build_chunks(doc, a0, b0):
-                self._process_chunk(name, btemp, ca, cb, payload, kind)
+                self._process_chunk(book_key, btemp, ca, cb, payload, kind)
 
         doc.close()
-        counts = self.state.counts(name)
-        out = self.layout.refined / f"{stem}.md"
-        assemble_book(btemp, out, stem,
-                      {"source": name, "sha256": sha, "counts": counts},
+        counts = self.state.counts(book_key)
+        out = self.layout.refined / f"{rel_stem}.md"
+        assemble_book(btemp, out, title,
+                      {"source": book_key, "sha256": sha, "counts": counts},
                       add_page_markers=self.cfg.get("output", "add_page_markers", default=True),
                       page_separator=self.cfg.get("output", "page_separator", default="---"))
         status = "done" if counts.get("done", 0) == total else "partial"
-        self.state.set_book_status(name, status, output=str(out))
-        log.info("Book %s -> %s [%s] %s", name, out, status, counts)
-        return {"book": name, "output": str(out), "status": status, "counts": counts}
+        self.state.set_book_status(book_key, status, output=str(out))
+        log.info("Book %s -> %s [%s] %s", book_key, out, status, counts)
+        return {"book": book_key, "output": str(out), "status": status, "counts": counts}
 
     # ------------------------------------------------------------------
     def _serialize(self, doc, a: int, b: int) -> bytes:

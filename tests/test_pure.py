@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from ocr_pipeline.drive import DriveLayout
 from ocr_pipeline.ocr.oxr_blocks import block_to_markdown, blocks_to_markdown, pages_to_markdown
 from ocr_pipeline.pdfutils.chunking import paginate_range, split_range
 from ocr_pipeline.settings import DEFAULTS, Cfg, deep_merge
@@ -88,6 +89,40 @@ class TestOxrBlocks(unittest.TestCase):
         out = pages_to_markdown(pages, page_base=4)  # chunk starts at 0-based page 4
         self.assertEqual(out[5], "one")
         self.assertEqual(out[6], "two")
+
+
+class TestDrive(unittest.TestCase):
+    def _make_tree(self, root):
+        raw = root / "raw"
+        (raw / "math" / "algebra").mkdir(parents=True)
+        (raw / "top.pdf").write_bytes(b"%PDF-1.4")
+        (raw / "math" / "mid.pdf").write_bytes(b"%PDF-1.4")
+        (raw / "math" / "algebra" / "deep.PDF").write_bytes(b"%PDF-1.4")
+        (raw / "math" / "notes.txt").write_text("not a pdf")
+        (root / "outside.pdf").write_bytes(b"%PDF-1.4")  # outside raw/ must be ignored
+
+    def test_list_pdfs_scans_subfolders_case_insensitive(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_tree(root)
+            rels = [p.relative_to(root / "raw").as_posix() for p in DriveLayout(root).list_pdfs()]
+            self.assertEqual(rels, ["math/algebra/deep.PDF", "math/mid.pdf", "top.pdf"])
+
+    def test_book_identity_and_paths(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_tree(root)
+            layout = DriveLayout(root)
+            pdf = root / "raw" / "math" / "algebra" / "deep.PDF"
+            self.assertEqual(layout.rel_id(pdf), "math/algebra/deep.PDF")
+            self.assertEqual(layout.rel_stem(pdf), "math/algebra/deep")
+            self.assertEqual(layout.display_name(pdf), "deep")
+            self.assertEqual(layout.book_temp(layout.rel_stem(pdf)),
+                             root / "temp" / "math" / "algebra" / "deep")
+            self.assertEqual(layout.refined / f"{layout.rel_stem(pdf)}.md",
+                             root / "refined" / "math" / "algebra" / "deep.md")
 
 
 class TestChunking(unittest.TestCase):

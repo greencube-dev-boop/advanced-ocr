@@ -1,6 +1,6 @@
 # Advanced OCR (v3 — 100% OXR-1.0)
 
-PDF book → clean, single Markdown file. Runs on **Google Colab**, keeps **all code in this GitHub repo** and **all data in Google Drive**, and is fully **resumable** — stop anytime, rerun, continue where it left off.
+PDF books → clean, individual Markdown files. Runs on **Google Colab**, keeps **all code in this GitHub repo** and **all data in Google Drive**, and is fully **resumable** — stop anytime, rerun, continue where it left off. `raw/` is scanned **recursively**, so you can organize PDFs in any subfolder system; `refined/` mirrors that structure.
 
 v3 uses **[SoMarkAI/OXR-1.0](https://github.com/SoMarkAI/OXR)**, a 1.3B document-parsing model, as the **only** engine: **every page of every PDF is parsed by OXR** (the native PDF text layer is not used at all), so the whole book gets uniform OXR structure — tables (Markdown), formulas (LaTeX `$$…$$`), chemical equations (mhchem), chemical structures (SMILES), code blocks, titles and reading order. **No API keys are needed at all.**
 
@@ -43,18 +43,21 @@ pending pages → contiguous chunks (≤20 pages AND ≤9 MiB per chunk;
 
 ```
 OCR Engine/
-  raw/       drop raw PDFs here            (e.g. raw/mybook.pdf)
+  raw/       raw PDF files — scanned recursively, so any subfolder system works:
+             raw/mybook.pdf, raw/math/algebra/book.pdf, ...
   config/
     pipeline.json   runtime settings (written by `init-config`, then editable in Drive)
     books.json      resume manifest — do not edit by hand
-  refined/     final output: mybook.md
-  temp/        per-book working files:
-    mybook/
-      p0001-0020.oxr.json     OXR JSON output (per-chunk source of truth)
-      p0001-0020.oxr.md       OXR markdown output (debug reference)
-      page-0001.final.md      final per-page Markdown (from native text or OXR)
-      page-0001.meta.json     decision trail (kind, engine, chunk, chars)
+  refined/     final output, mirroring the raw/ structure:
+               raw/math/algebra/book.pdf -> refined/math/algebra/book.md
+  temp/        per-book working files, mirrored too (temp/math/algebra/book/):
+    page-0001.final.md      final per-page Markdown (OXR JSON blocks -> Markdown)
+    p0001-0020.oxr.json     OXR JSON output (per-chunk source of truth)
+    p0001-0020.oxr.md       OXR markdown output (debug reference)
+    page-0001.meta.json     decision trail (engine, chunk, chars)
 ```
+
+A book's identity is its path relative to `raw/` (e.g. `math/algebra/book.pdf`), so same-named PDFs in different subfolders never collide.
 
 ## Usage on Colab
 
@@ -66,9 +69,9 @@ The notebook cells call the CLI:
 python -m ocr_pipeline doctor        --drive-root "/content/drive/MyDrive/OCR Engine"
 python -m ocr_pipeline init-config   --drive-root ...   # once: write default settings to Drive
 python -m ocr_pipeline status        --drive-root ...   # show resume state
-python -m ocr_pipeline run           --drive-root ...   # process all pending PDFs (resumable)
-python -m ocr_pipeline run-book mybook.pdf --drive-root ...
-python -m ocr_pipeline reset mybook.pdf    --drive-root ...   # forget state + temp, reprocess from scratch
+python -m ocr_pipeline run           --drive-root ...   # process all pending PDFs in raw/ (resumable, recursive)
+python -m ocr_pipeline run-book math/algebra/book.pdf --drive-root ...   # path relative to raw/
+python -m ocr_pipeline reset math/algebra/book.pdf    --drive-root ...   # forget state + temp, reprocess
 ```
 
 - **Resume**: state lives in `OCR Engine/config/books.json`. A page is only marked `done` after its final markdown is on disk, so rerunning redoes only the unfinished pages. Failed OXR chunks are retried on the next run (up to `chunking.chunk_retries`, then the pages are marked `error`). If a PDF changes on disk (sha256 mismatch), its page states reset.
